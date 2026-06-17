@@ -3,8 +3,15 @@
 """
 自动调度器 v2：定时扫描 → 输出建议 → 自动启动/关停批处理
 每5分钟扫描25币种，≥60分自动起 bat，<40分自动关
+
+安全 CLI:
+  python _auto_deploy.py                     # 进入自动部署主循环
+  python _auto_deploy.py --help              # 显示帮助
+  python _auto_deploy.py --dry-run           # 只扫描不启动 (等价--once --no-start)
+  python _auto_deploy.py --once --no-start   # 只跑一轮不启动
+  python _auto_deploy.py --dry-run --symbols BTC MATIC RNDR  # 指定币种
 """
-import json, sys, io, os, time, subprocess, signal
+import json, sys, io, os, time, subprocess, signal, argparse
 from datetime import datetime
 from urllib.request import Request, urlopen
 from pathlib import Path
@@ -227,13 +234,84 @@ def release_lock():
         pass
 
 
+# ── CLI ─────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="200x Commander 自动调度器 — 扫描25币种，自动进场/离场"
+    )
+    p.add_argument("--dry-run", action="store_true",
+                   help="只扫描不启动 bat。等价于 --once --no-start")
+    p.add_argument("--once", action="store_true",
+                   help="只执行一轮扫描后退出")
+    p.add_argument("--no-start", action="store_true",
+                   help="禁止启动 bat，只输出决策")
+    p.add_argument("--symbols", nargs="+", metavar="SYM",
+                   help="只评估指定币种，例如 --symbols BTC MATIC RNDR")
+    return p
+
+
+def _resolve_coins(args):
+    """Return filtered coin list based on --symbols flag."""
+    if not args.symbols:
+        return COINS
+
+    requested = set()
+    for s in args.symbols:
+        requested.add(s.upper() + "_USDT" if "_" not in s.upper() else s.upper())
+    coins = [c for c in COINS if c in requested]
+    missing = requested - set(coins)
+
+    if coins:
+        print(f"[symbols] 匹配 {len(coins)} 个: {', '.join(coins)}")
+    else:
+        print(f"[symbols] 无匹配币种: {', '.join(sorted(requested))}")
+    if missing:
+        print(f"[symbols] 以下币种不在候选列表或不受支持: {', '.join(sorted(missing))}")
+
+    return coins
+
+
+def _mode_tags(args):
+    """Build a human-readable mode tag string."""
+    tags = []
+    if args.dry_run:
+        tags.append("DRY-RUN")
+    if args.once:
+        tags.append("ONCE")
+    if args.no_start:
+        tags.append("NO-START")
+    if args.symbols:
+        tags.append("FILTER")
+    return f"  [{', '.join(tags)}]" if tags else ""
+
+
 # ── 主循环 ─────────────────────────────────────────────────────
 
-def main():
-    acquire_lock()
+def main(args=None):
+    if args is None:
+        parser = build_parser()
+        args = parser.parse_args()
+
+    # --dry-run implies --once + --no-start
+    if args.dry_run:
+        args.once = True
+        args.no_start = True
+
+    coins = _resolve_coins(args)
+    if not coins:
+        sys.exit(1)
+
+    # Only acquire lock if we might modify state (full loop without --no-start)
+    needs_lock = not args.once or not args.no_start
+    if needs_lock:
+        acquire_lock()
+
+    mode_str = _mode_tags(args)
+
     print("=" * 75)
     print("  自动调度器 v2 — 扫描 → 自动起/停批处理")
-    print(f"  进场 ≥{ENTRY_THRESHOLD}分 | 离场 <{EXIT_THRESHOLD}分 | 间隔 {SCAN_INTERVAL}s")
+    print(f"  进场 ≥{ENTRY_THRESHOLD}分 | 离场 <{EXIT_THRESHOLD}分 | 间隔 {SCAN_INTERVAL}s{mode_str}")
     print("=" * 75)
     sys.stdout.flush()
 
@@ -245,17 +323,29 @@ def main():
             sys.stdout.flush()
 
             results = []
-            for sym in COINS:
+            for sym in coins:
                 klines = fetch_klines(sym)
                 if not klines or len(klines) < 50:
+                    if args.symbols:
+                        print(f"  ✗ {sym}: klines 获取失败或无数据（symbol 可能不存在于 Gate.io）")
                     continue
                 for k in klines:
                     k["_symbol"] = sym
                 r = analyze(klines)
                 if r is None:
+                    if args.symbols:
+                        print(f"  ✗ {sym}: 分析失败（数据量不足）")
                     continue
                 r["score"] = score(r)
                 results.append(r)
+
+            if not results:
+                print("  (无可用数据)")
+                if args.once:
+                    break
+                print(f"  ▸ 下次扫描: {SCAN_INTERVAL}s 后")
+                time.sleep(SCAN_INTERVAL)
+                continue
 
             results.sort(key=lambda x: x["score"], reverse=True)
 
@@ -264,27 +354,49 @@ def main():
             for r in results:
                 sym = r["symbol"]
                 active = sym in active_bats
-                status = "运行中" if active else ("→进场" if r["score"] >= ENTRY_THRESHOLD else "")
-                marker = "★" if r["score"] >= ENTRY_THRESHOLD else " "
-                print(f"  {marker}{sym:<13} {r['price']:>10.4f} {r['adx']:>5.1f} {r['atr_pct']:>5.3f}% {r['vol_ratio']:>5.2f}  {r['score']:>4.0f}  {status}")
+                would_start = r["score"] >= ENTRY_THRESHOLD and not active
+                if args.no_start:
+                    status = "→进场" if would_start else ("运行中(禁)" if active else "")
+                else:
+                    status = "运行中" if active else ("→进场" if would_start else "")
+                marker = "★" if would_start else " "
+                print(f"  {marker}{sym:<13} {r['price']:>10.4f} {r['adx']:>5.1f} "
+                      f"{r['atr_pct']:>5.3f}% {r['vol_ratio']:>5.2f}  {r['score']:>4.0f}  {status}")
             sys.stdout.flush()
 
-            # 自动操作 — API 降级时跳过，防止误杀
+            # 自动操作 — API 降级/安全模式时跳过
             if api_is_degraded():
-                print(f"  ⚠ API 持续失败 ({API_ERRORS}次)，跳过进场/离场决策")
-            else:
+                if not args.no_start:
+                    print(f"  ⚠ API 持续失败 ({API_ERRORS}次)，跳过进场/离场决策")
+            elif not args.no_start:
                 for r in results:
                     sym = r["symbol"]
                     if r["score"] >= ENTRY_THRESHOLD and sym not in active_bats:
                         start_bat(sym)
                     elif r["score"] < EXIT_THRESHOLD and sym in active_bats:
                         stop_bat(sym)
+            else:
+                # --no-start: 只输出决策，不执行
+                would_start = [r["symbol"] for r in results
+                               if r["score"] >= ENTRY_THRESHOLD and r["symbol"] not in active_bats]
+                would_stop = [s for s in active_bats
+                              if any(r["symbol"] == s and r["score"] < EXIT_THRESHOLD for r in results)]
+                if would_start:
+                    print(f"\n  [NO-START] 将进场(未启动): {', '.join(would_start)}")
+                if would_stop:
+                    print(f"  [NO-START] 将离场(未执行): {', '.join(would_stop)}")
+                if not would_start and not would_stop:
+                    print(f"\n  [NO-START] 无操作")
 
             if active_bats:
                 print(f"\n  ▸ 运行中: {', '.join(active_bats.keys())}  ({len(active_bats)}个)")
             else:
                 print(f"\n  ▸ 无运行中的策略")
             sys.stdout.flush()
+
+            if args.once:
+                print(f"\n  ▸ --once 模式，退出。")
+                break
 
             print(f"  ▸ 下次扫描: {SCAN_INTERVAL}s 后")
             time.sleep(SCAN_INTERVAL)
@@ -295,6 +407,13 @@ def main():
         release_lock()
         print("  退出。")
 
+    if not needs_lock:
+        pass  # lock was never acquired, nothing to release
+    elif not (args.once and not args.no_start):
+        release_lock()
+
 
 if __name__ == "__main__":
-    main()
+    parser = build_parser()
+    args = parser.parse_args()
+    main(args)
