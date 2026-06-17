@@ -1,11 +1,14 @@
 """通用报告：python _report.py [state_file_path]"""
 import json, sys, io, os
+from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+_BASE = Path(__file__).resolve().parent
 
 if len(sys.argv) > 1:
     STATE_FILE = sys.argv[1]
 else:
-    STATE_FILE = r"C:\Users\Administrator\200x_commander\rt_paper_v2_state.json"
+    STATE_FILE = str(_BASE / "rt_paper_v2_state.json")
 
 if not os.path.exists(STATE_FILE):
     print(f"  :: 文件不存在: {STATE_FILE}")

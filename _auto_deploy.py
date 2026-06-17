@@ -7,15 +7,16 @@
 import json, sys, io, os, time, subprocess, signal
 from datetime import datetime
 from urllib.request import Request, urlopen
+from pathlib import Path
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+BAT_DIR = str(Path(__file__).resolve().parent)
 
 GATE_API = "https://api.gateio.ws/api/v4"
 SCAN_INTERVAL = 300
 ENTRY_THRESHOLD = 60
 EXIT_THRESHOLD = 40
-
-BAT_DIR = r"C:\Users\Administrator\200x_commander"
 
 COINS = [
     "BTC_USDT", "ETH_USDT", "SOL_USDT", "BNB_USDT", "XRP_USDT",

@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """仪表盘：python _dash.py —— 扫描所有 state 文件，显示全部在跑币种的净值"""
 import json, sys, io, os, glob, logging
+from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 logging.basicConfig(level=logging.WARNING, format="[%(levelname)s] %(message)s")
 
-BASE = r"C:\Users\Administrator\200x_commander"
+BASE = str(Path(__file__).resolve().parent)
 
 # All 25 coins the auto_deploy scans
 ALL_COINS = [
