@@ -1,0 +1,7 @@
+# Core runtime
+pandas>=2.0.0
+websocket-client>=1.6.0
+gate-api>=7.0.0
+
+# Optional / utility
+python-dotenv>=1.0.0
