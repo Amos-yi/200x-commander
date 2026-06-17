@@ -12,6 +12,7 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 BAT_DIR = str(Path(__file__).resolve().parent)
+LOCK_FILE = os.path.join(BAT_DIR, '.auto_deploy.lock')
 
 GATE_API = "https://api.gateio.ws/api/v4"
 SCAN_INTERVAL = 300
@@ -173,9 +174,63 @@ def stop_all():
         stop_bat(sym)
 
 
+def verify_active_pids():
+    """Remove stale PIDs from active_bats that no longer exist or are not Python processes."""
+    import subprocess as _sp
+    stale = []
+    for sym, pid in list(active_bats.items()):
+        try:
+            result = _sp.run(
+                ["tasklist", "/fi", f"PID eq {pid}", "/fo", "csv", "/nh"],
+                capture_output=True, text=True, timeout=5
+            )
+            if f'"{pid}"' not in result.stdout or 'python' not in result.stdout.lower():
+                stale.append(sym)
+        except Exception:
+            stale.append(sym)
+    for sym in stale:
+        print(f"  ⚠ {sym} PID丢失（僵尸），从活跃列表移除")
+        active_bats.pop(sym, None)
+
+
+def acquire_lock():
+    """Prevent concurrent auto_deploy instances via lock file."""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE) as f:
+                old_pid = f.read().strip()
+            # Check if the old PID is still running
+            result = subprocess.run(
+                ["tasklist", "/fi", f"PID eq {old_pid}", "/fo", "csv", "/nh"],
+                capture_output=True, text=True, timeout=5
+            )
+            if f'"{old_pid}"' in result.stdout and 'python' in result.stdout.lower():
+                print(f"✗ _auto_deploy 已在运行 (pid={old_pid})，退出。")
+                sys.exit(1)
+        except Exception:
+            pass
+        # Old lock is stale — remove and proceed
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    print(f"  锁获取成功 (pid={os.getpid()})")
+
+
+def release_lock():
+    """Release the concurrency lock on exit."""
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
 # ── 主循环 ─────────────────────────────────────────────────────
 
 def main():
+    acquire_lock()
     print("=" * 75)
     print("  自动调度器 v2 — 扫描 → 自动起/停批处理")
     print(f"  进场 ≥{ENTRY_THRESHOLD}分 | 离场 <{EXIT_THRESHOLD}分 | 间隔 {SCAN_INTERVAL}s")
@@ -184,6 +239,7 @@ def main():
 
     try:
         while True:
+            verify_active_pids()  # 先清理僵尸PID
             now = datetime.now().strftime("%H:%M:%S")
             print(f"\n[{now}] 扫描中...")
             sys.stdout.flush()
@@ -236,6 +292,7 @@ def main():
     except KeyboardInterrupt:
         print("\n  关停所有...")
         stop_all()
+        release_lock()
         print("  退出。")
 
 

@@ -36,6 +36,8 @@ for key, d in data.items():
     total_l = sum(abs(t.get("pnl", 0)) for t in trades if t.get("pnl", 0) < 0)
     wr = wins / tc * 100 if tc else 0
     pf = total_p / total_l if total_l > 0 else 99.9
+    # TODO(CONFIG): avg_r uses hardcoded risk=15.0U based on margin=5U × stop=1.5% × leverage=200x.
+    # If MARGIN_PCT, HARD_STOP_PCT, or LEVERAGE change in rt_paper_v2.py, update this constant.
     avg_r = sum(abs(t.get("pnl", 0)) / 15.0 for t in trades) / tc if tc else 0
     dd = (1 - eq / peak) * 100 if peak > 0 else 0
     pos = d.get("position")

@@ -3,6 +3,7 @@
 *.jsonl
 *.bak
 *.tmp
+.auto_deploy.lock
 
 # Logs
 logs/
