@@ -31,6 +31,40 @@ import core.okx_strategies_advanced
 
 STRATEGIES = CORE_STRATEGIES
 
+# ── Deploy Config Filter (PLAN C) ──
+_DEPLOY_CONFIG = None
+_DEPLOY_MARGIN = {}
+_deploy_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() and __file__ else os.getcwd(), "deploy_config.json")
+if os.path.exists(_deploy_cfg_path):
+    try:
+        with open(_deploy_cfg_path, "r", encoding="utf-8") as _dcf:
+            _DEPLOY_CONFIG = json.load(_dcf)
+        _coin = os.environ.get("RT_SYMBOL", "").split("_")[0]
+        _whitelist = _DEPLOY_CONFIG.get("strategies", {}).get(_coin, [])
+        _tiers = _DEPLOY_CONFIG.get("tiers", {})
+        for _tier_name, _tier_data in _tiers.items():
+            if _coin in _tier_data.get("coins", []):
+                _margin = _tier_data.get("margin_per_strat", 1.0)
+                for _s in _whitelist:
+                    _DEPLOY_MARGIN[_s] = _margin
+        if _whitelist:
+            _whitelist_upper = [s.upper() for s in _whitelist]
+            _final = {}
+            for _k, _v in STRATEGIES.items():
+                try:
+                    _obj = _v()
+                    _n = _obj.name.upper()
+                    if any(_n == w or _n.startswith(w) for w in _whitelist_upper):
+                        _final[_k] = _v
+                except Exception:
+                    pass
+            if _final:
+                STRATEGIES = _final
+                print(f"[deploy_config] {os.environ.get('RT_SYMBOL','?')}: filtered {len(CORE_STRATEGIES)}->{len(STRATEGIES)} strategies: {_whitelist}")
+                print(f"[deploy_config] per-strat margin (target): {_DEPLOY_MARGIN}")
+    except Exception as _e:
+        print(f"[deploy_config] load failed: {_e}, using all strategies")
+
 # ── 常量 ──
 import os as _os_const
 _BASE_DIR = _os_const.path.dirname(_os_const.path.abspath(

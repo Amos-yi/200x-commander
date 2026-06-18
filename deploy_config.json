@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "created": "2026-06-19",
+  "total_capital": 100.0,
+  "leverage": 200,
+  "stop_loss_pct": 1.5,
+  "description": "PLAN C — 85%+ WR, >=3 trades, weighted allocation, 43 strats x 23 coins",
+
+  "tiers": {
+    "S": {"margin_per_strat": 0.9,  "strats_per_coin": 3, "coins": ["UNI","AVAX","APT","SOL"]},
+    "A": {"margin_per_strat": 0.8,  "strats_per_coin": 2, "coins": ["TIA","FIL","ARB","FET","ADA","INJ","SUI","OP","LTC","LINK","ATOM","SEI"]},
+    "B": {"margin_per_strat": 0.6,  "strats_per_coin": 1, "coins": ["DOGE","XRP","BNB","ETH","DOT","RUNE","BTC"]}
+  },
+
+  "strategies": {
+    "UNI":  ["T3","TRIX","EMA"],
+    "AVAX": ["KELTNER_CHANNEL","BOLLINGER_BANDS","MACD"],
+    "APT":  ["MOMENTUM_REVERSAL","KELTNER_CHANNEL","LINEARREG"],
+    "SOL":  ["MOMENTUM_REVERSAL","EMA","CORRELATION_FILTER"],
+    "TIA":  ["VOLATILITY_MEAN_REVERSION","RVGI"],
+    "FIL":  ["PPO","MACD"],
+    "ARB":  ["AWESOME_OSCILLATOR","MOMENTUM_REVERSAL"],
+    "FET":  ["KELTNER_CHANNEL","BOLLINGER_BANDS"],
+    "ADA":  ["EMA","DUAL_MA_WITH_RSI"],
+    "INJ":  ["OBV","ROC"],
+    "SUI":  ["KELTNER_CHANNEL","BOLLINGER_BANDS"],
+    "OP":   ["MOMENTUM_REVERSAL","RSI"],
+    "LTC":  ["MACD","PPO"],
+    "LINK": ["RSI","MONEY_FLOW_INDEX"],
+    "ATOM": ["AROON","WILDERS"],
+    "SEI":  ["TRIX","WMA"],
+    "DOGE": ["DPO"],
+    "XRP":  ["MOMENTUM_REVERSAL"],
+    "BNB":  ["FORCE_INDEX"],
+    "ETH":  ["KELTNER_CHANNEL"],
+    "DOT":  ["CHANDELIER_EXIT"],
+    "RUNE": ["OBV"],
+    "BTC":  ["MOMENTUM_REVERSAL"]
+  },
+
+  "safety": {
+    "margin_deployed": 34.2,
+    "reserve_buffer": 65.8,
+    "per_strat_stop_loss": {"S": 2.70, "A": 2.40, "B": 1.80},
+    "max_concurrent_positions": 18,
+    "worst_case_all_stop": 102.6,
+    "realistic_concurrent_stop": 42.9,
+    "warning": "200x leverage: 强平距离0.5%, 止损1.5%在强平线之下, 实际出场为爆仓而非止损"
+  }
+}
