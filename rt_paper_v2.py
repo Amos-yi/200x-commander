@@ -8,7 +8,7 @@ import os
 os.environ['LANG'] = 'en_US.UTF-8'
 
 # ── 必须：在任何第三方库导入前移除 CWD，防止 _macro_calendar.py / config.py 等影蔽标准库 ──
-import json, sys, time, statistics, threading, glob as _glob, shutil as _shutil, os as _os_sys
+import json, sys, time, statistics, threading, atexit, glob as _glob, shutil as _shutil, os as _os_sys
 sys.path = [p for p in sys.path if p not in ('', '.')]
 _base_gate = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() and __file__ else os.getcwd(), '..', 'gate_bot')
 # fallback: if not relative, try known location relative to this script's dir or CWD
@@ -33,20 +33,26 @@ STRATEGIES = CORE_STRATEGIES
 
 # ── Deploy Config Filter (PLAN C) ──
 _DEPLOY_CONFIG = None
-_DEPLOY_MARGIN = {}
-_deploy_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() and __file__ else os.getcwd(), "deploy_config.json")
+_DEPLOY_EQUITY = {}  # per-strategy equity from config (USDT)
+_deploy_cfg_path = os.path.join(os.path.dirname(os.path.abspath(
+    __file__ if '__file__' in dir() and __file__ else
+    os.environ.get('RT_STATE_FILE', os.getcwd())
+)), "deploy_config.json")
+print(f"[deploy_config] looking at: {_deploy_cfg_path}  (exists={os.path.exists(_deploy_cfg_path)})  __file__={'YES' if '__file__' in dir() and __file__ else 'NO'}")
 if os.path.exists(_deploy_cfg_path):
     try:
         with open(_deploy_cfg_path, "r", encoding="utf-8") as _dcf:
             _DEPLOY_CONFIG = json.load(_dcf)
         _coin = os.environ.get("RT_SYMBOL", "").split("_")[0]
         _whitelist = _DEPLOY_CONFIG.get("strategies", {}).get(_coin, [])
+        print(f"[deploy_config] coin={_coin} whitelist={_whitelist}")
         _tiers = _DEPLOY_CONFIG.get("tiers", {})
+        _equity_per_strat = 2.33  # default fallback
         for _tier_name, _tier_data in _tiers.items():
             if _coin in _tier_data.get("coins", []):
-                _margin = _tier_data.get("margin_per_strat", 1.0)
-                for _s in _whitelist:
-                    _DEPLOY_MARGIN[_s] = _margin
+                _equity_per_strat = _tier_data.get("equity_per_strat", 2.33)
+                print(f"[deploy_config] tier={_tier_name} equity_per_strat={_equity_per_strat}")
+                break
         if _whitelist:
             _whitelist_upper = [s.upper() for s in _whitelist]
             _final = {}
@@ -54,23 +60,34 @@ if os.path.exists(_deploy_cfg_path):
                 try:
                     _obj = _v()
                     _n = _obj.name.upper()
-                    if any(_n == w or _n.startswith(w) for w in _whitelist_upper):
+                    # Exact match only (no prefix matching to avoid catching variants)
+                    if _n in _whitelist_upper:
                         _final[_k] = _v
+                        _DEPLOY_EQUITY[_k] = _equity_per_strat
+                        print(f"[deploy_config] matched: {_k} -> {_obj.name} (equity={_equity_per_strat})")
                 except Exception:
                     pass
             if _final:
                 STRATEGIES = _final
                 print(f"[deploy_config] {os.environ.get('RT_SYMBOL','?')}: filtered {len(CORE_STRATEGIES)}->{len(STRATEGIES)} strategies: {_whitelist}")
-                print(f"[deploy_config] per-strat margin (target): {_DEPLOY_MARGIN}")
+                print(f"[deploy_config] per-strat equity: {_equity_per_strat} USDT")
+            else:
+                print(f"[deploy_config] WARNING: whitelist={_whitelist} but no strategies matched!")
     except Exception as _e:
-        print(f"[deploy_config] load failed: {_e}, using all strategies")
+        import traceback
+        print(f"[deploy_config] load failed: {_e}")
+        traceback.print_exc()
 
 # ── 常量 ──
 import os as _os_const
-_BASE_DIR = _os_const.path.dirname(_os_const.path.abspath(
-    _os_const.path.join(_os_const.getcwd(), __file__)
-    if '__file__' in dir() and __file__ else _os_const.getcwd()
-))
+if '__file__' in dir() and __file__:
+    _BASE_DIR = _os_const.path.dirname(_os_const.path.abspath(__file__))
+elif _os_const.environ.get("RT_STATE_FILE"):
+    # -c exec 模式下 __file__ 不可用，从 RT_STATE_FILE 反推目录
+    _BASE_DIR = _os_const.path.dirname(_os_const.path.abspath(
+        _os_const.environ["RT_STATE_FILE"]))
+else:
+    _BASE_DIR = _os_const.path.abspath(_os_const.getcwd())
 _SYMBOL = _os_const.environ.get("RT_SYMBOL", "SOL_USDT")
 _STATE_DEFAULT = _os_const.path.join(_BASE_DIR, "rt_paper_v2_state.json")
 _STATE = _os_const.environ.get("RT_STATE_FILE", _STATE_DEFAULT)
@@ -88,10 +105,14 @@ LEVERAGE = 200
 HARD_STOP_PCT = 0.015
 TP1_PCT = 0.03
 TP2_PCT = 0.05
+TAKER_FEE = 0.0005   # 0.05% 吃单
+MAKER_FEE = 0.0002   # 0.02% 挂单
+SLIPPAGE = 0.0003    # 0.03% 滑点（吃单成交）
 MIN_BARS = 50
 LEADERBOARD_INTERVAL = 60
 TIME_STOP_HOURS = 8
 GATE_API = "https://api.gateio.ws/api/v4"
+WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=492a138a-c3df-4e7c-9a87-ad8fa1bbfdfa"
 
 
 class StrategyTrack:
@@ -221,7 +242,8 @@ class RealTimePaperTraderV2:
                     name_counts[name] = 1
                     display_name = name
                 uniq_key = f"{skey}_{name_counts[name]}" if name_counts[name] > 1 else skey
-                self.tracks[uniq_key] = StrategyTrack(uniq_key, display_name, obj)
+                _eq = _DEPLOY_EQUITY.get(skey, 100.0)
+                self.tracks[uniq_key] = StrategyTrack(uniq_key, display_name, obj, equity=_eq)
             except Exception as e:
                 print(f"  加载失败 [{skey}]: {e}")
 
@@ -230,9 +252,20 @@ class RealTimePaperTraderV2:
         self._last_leaderboard_print = 0.0
         self._last_hourly_report = time.time()
         self._last_state_save = time.time()
+        self._last_heartbeat = 0.0
         self._ws = None
         self._lock = threading.Lock()
+        atexit.register(self._safe_shutdown)
         self._load_state()
+
+        # 写 PID 文件，供 STOP 脚本精确关停
+        _coin = SYMBOL.split('_')[0].lower()
+        _pid_path = _os_sys.path.join(LOG_DIR, f"pid_{_coin}.txt")
+        try:
+            with open(_pid_path, "w") as _pf:
+                _pf.write(str(_os_sys.getpid()))
+        except Exception:
+            pass
 
     def _fetch_klines_rest(self, limit: int = 200) -> List[dict]:
         endpoint = f"/futures/usdt/candlesticks?contract={SYMBOL}&interval={INTERVAL}&limit={limit}"
@@ -308,6 +341,7 @@ class RealTimePaperTraderV2:
         # 订阅成功不再刷日志
 
     def _on_message(self, ws, raw):
+        self._update_heartbeat()
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -376,10 +410,26 @@ class RealTimePaperTraderV2:
             self._save_hourly_report()
             self._last_hourly_report = time.time()
 
-        # 每5分钟存档状态（防止崩了丢持仓数据）
-        if time.time() - self._last_state_save >= 300:
+        # 每1分钟存档状态（防止崩了丢持仓数据）
+        if time.time() - self._last_state_save >= 60:
             self._save_state()
             self._last_state_save = time.time()
+
+        # 健康心跳（同时走 _on_message 和 _on_tick 双保险）
+        self._update_heartbeat()
+
+    def _update_heartbeat(self):
+        """每 15 秒写心跳文件，守护进程据此判断进程存活"""
+        _now = time.time()
+        if _now - self._last_heartbeat >= 15:
+            _coin = SYMBOL.split('_')[0].lower()
+            _hb_path = _os_sys.path.join(LOG_DIR, f"heartbeat_{_coin}.txt")
+            try:
+                with open(_hb_path, "w", encoding="utf-8") as _hb:
+                    _hb.write(datetime.now().isoformat())
+            except Exception:
+                pass  # 任何原因都静默忽略，不阻塞交易
+            self._last_heartbeat = _now
 
     def _process_track(self, key, track, df, current_candle, now, dt_str):
         if track.locked_until and now >= track.locked_until:
@@ -421,6 +471,8 @@ class RealTimePaperTraderV2:
         if not signals:
             return None
         sig = signals[-1]
+        if sig is None:
+            return None
         if sig.signal_type not in ("BUY", "SELL"):
             return None
         return sig
@@ -483,6 +535,7 @@ class RealTimePaperTraderV2:
             tp1 = entry_price * (1 - TP1_PCT)
             tp2 = entry_price * (1 - TP2_PCT)
 
+        entry_notional = size * entry_price
         track.position = {
             "side": direction,
             "entry_price": entry_price,
@@ -495,9 +548,17 @@ class RealTimePaperTraderV2:
             "breakeven_activated": False,
             "tp1_hit": False,
             "tp2_hit": False,
+            "entry_notional": entry_notional,
         }
+        dir_cn = "多" if direction == "long" else "空"
         print(f"[{track.name}] 开仓 {direction.upper()} @ {entry_price:.2f} "
               f"止损:{stop_price:.2f} TP1:{tp1:.2f} TP2:{tp2:.2f}")
+        self._notify_trade(
+            f"📈 {track.name} 开{dir_cn}",
+            f"入场: **{entry_price:.4f}**\n"
+            f"止损: {stop_price:.4f} | 止盈1: {tp1:.4f} | 止盈2: {tp2:.4f}\n"
+            f"保证金: {margin:.2f}U")
+
 
     def _close_position(self, track, exit_price, exit_reason, now):
         pos = track.position
@@ -508,6 +569,24 @@ class RealTimePaperTraderV2:
             pnl = (exit_price - entry) * pos["size"]
         else:
             pnl = (entry - exit_price) * pos["size"]
+
+        # 手续费：入场吃单 0.05% + 出场（止损/反转=吃单，止盈=挂单）
+        entry_notional = pos.get("entry_notional", pos["size"] * entry)
+        entry_fee = entry_notional * TAKER_FEE
+        if exit_reason in ("TP1目标达成", "TP2目标达成"):
+            exit_fee = entry_notional * MAKER_FEE
+        else:
+            exit_fee = entry_notional * TAKER_FEE
+        total_fee = entry_fee + exit_fee
+        pnl -= total_fee
+
+        # 滑点：入场必吃单(滑点0.03%) + 出场止盈挂单(无滑点)，止损/反转吃单(滑点0.03%)
+        entry_slippage = entry_notional * SLIPPAGE
+        if exit_reason in ("TP1目标达成", "TP2目标达成"):
+            exit_slippage = 0.0
+        else:
+            exit_slippage = entry_notional * SLIPPAGE
+        pnl -= (entry_slippage + exit_slippage)
 
         track.equity += pnl
         if track.equity > track.peak_equity:
@@ -536,9 +615,49 @@ class RealTimePaperTraderV2:
         print(f"[{track.name}] {emoji}{pnl:+.2f}U ({r_mult:+.2f}R) "
               f"原因:{exit_reason} 净值:{track.equity:.2f}")
 
+        pnl_sign = "+" if pnl >= 0 else ""
+        dir_cn = "多" if direction == "long" else "空"
+
+        # 中文原因
+        reason_map = {
+            "止损": "止损",
+            "TP1目标达成": "止盈1达成",
+            "TP2目标达成": "止盈2达成",
+            "信号反转": "信号反转",
+            "时间止损": "时间止损",
+        }
+        reason_cn = reason_map.get(exit_reason, exit_reason)
+
+        self._notify_trade(
+            f"💰 {track.name} 平{dir_cn}",
+            f"入场: {entry:.4f} → 出场: **{exit_price:.4f}**\n"
+            f"盈亏: {pnl_sign}{pnl:+.4f}U ({r_mult:+.2f}R) | {reason_cn}\n"
+            f"净值: {track.equity:.2f}U")
+
         track.position = None
         track.last_close_time = now
         self._save_state()
+
+    def _notify_trade(self, title: str, body: str):
+        """Send trade notification to WeChat webhook (fire-and-forget)."""
+        import json as _json, urllib.request as _ur
+        coin = SYMBOL.split("_")[0] if "_" in SYMBOL else SYMBOL
+        content = f"**{coin}** | {title}\n{body}"
+        payload = _json.dumps({
+            "msgtype": "markdown",
+            "markdown": {"content": content},
+        }, ensure_ascii=False).encode("utf-8")
+        def _send():
+            try:
+                req = _ur.Request(WEBHOOK_URL, data=payload,
+                                  headers={"Content-Type": "application/json; charset=utf-8"})
+                with _ur.urlopen(req, timeout=5) as resp:
+                    result = _json.loads(resp.read().decode())
+                    if result.get("errcode") != 0:
+                        print(f"[Webhook] 推送失败: {result}")
+            except Exception as e:
+                print(f"[Webhook] 推送异常: {e}")
+        threading.Thread(target=_send, daemon=True).start()
 
     def _print_leaderboard(self, active_positions: int):
         ranked = sorted(self.tracks.values(), key=lambda t: t.equity, reverse=True)
@@ -687,6 +806,13 @@ class RealTimePaperTraderV2:
         except Exception as e:
             print(f"保存状态失败: {e}")
 
+    def _safe_shutdown(self):
+        """atexit 兜底：进程无论怎么死都保存状态"""
+        try:
+            self._save_state()
+        except Exception:
+            pass  # 静默失败，不阻塞退出
+
     def _load_state(self):
         if not os.path.exists(STATE_FILE):
             return
@@ -735,7 +861,7 @@ class RealTimePaperTraderV2:
             print(f"状态恢复失败: {e}")
 
 
-def rotate_log(log_path, max_size_mb=50, keep=3):
+def rotate_log(log_path, max_size_mb=5, keep=3):
     """Rotate log file if it exceeds max_size_mb."""
     try:
         if os.path.exists(log_path) and os.path.getsize(log_path) > max_size_mb * 1024 * 1024:

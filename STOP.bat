@@ -1,6 +1,4 @@
 @echo off
-echo 关停所有...
-taskkill /f /im python.exe >nul 2>&1
-taskkill /f /im cmd.exe >nul 2>&1
-echo 已关停
+echo === STOP Plan C (23-coin paper cluster) ===
+C:\Users\Administrator\gate_bot\.venv\Scripts\python.exe C:\Users\Administrator\200x_commander\stop_plan_c.py
 pause
