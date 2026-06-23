@@ -53,6 +53,7 @@ class Commander:
     def __init__(self, gate_client):
         self.client = gate_client
         self.paper = PAPER_MODE
+        self.pushplus = PushPlus(os.getenv("PUSHPLUS_TOKEN", ""))
         self.lead_trader = self._init_lead_trader()
         self.state = self._load_or_init()
         self.stage = StageManager(self.state.get("equity", 100.0))
@@ -62,7 +63,6 @@ class Commander:
         self.fwd = ForwardValidator(bars_to_wait=45)   # 45 ticks ≈ 45 分钟 ≈ 3x15m K线
         self.macro = MacroFilter()
         self._pending_signal = None
-        self.pushplus = PushPlus(os.getenv("PUSHPLUS_TOKEN", ""))
 
         if self.paper:
             self.executor = PaperExecutionLayer(
