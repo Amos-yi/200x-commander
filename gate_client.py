@@ -41,7 +41,7 @@ def init_gate_client() -> FuturesApi:
 
 def _load_dotenv():
     """加载 .env 文件到环境变量（不覆盖已有值）。"""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(env_path):
         return
     try:

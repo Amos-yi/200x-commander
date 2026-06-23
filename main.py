@@ -19,6 +19,8 @@ from _macro_calendar import Calendar, detect_regime
 from strategic_brain import StrategicBrain
 from tactical_brain import TacticalBrain, Signal
 from execution_layer import ExecutionLayer
+from gate_client import init_gate_client
+from lead_trader import LeadTrader, load_copy_trading_config
 from trade_logger import log_trade, recent_stats
 
 # ── 日志 ──
@@ -47,6 +49,7 @@ class Commander:
 
     def __init__(self, gate_client):
         self.client = gate_client
+        self.lead_trader = self._init_lead_trader()
         self.state = self._load_or_init()
         self.stage = StageManager(self.state.get("equity", 100.0))
         self.locks = LockManager()
@@ -61,6 +64,18 @@ class Commander:
 
         os_signal.signal(os_signal.SIGINT, self._on_shutdown)
         os_signal.signal(os_signal.SIGTERM, self._on_shutdown)
+
+    def _init_lead_trader(self):
+        """初始化带单模块，注入 PushPlus 通知。"""
+        ct_cfg = load_copy_trading_config()
+        lt = LeadTrader(self.client, ct_cfg)
+        # 注入 PushPlus 通知（如果可用）
+        try:
+            from pushplus import pushplus
+            lt.set_notifier(pushplus)
+        except Exception:
+            pass
+        return lt
 
     # ═══════════════════════════════════════════
     #  主循环
