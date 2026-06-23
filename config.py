@@ -107,6 +107,17 @@ PROFIT_RULES = {
     4: {"withdraw_pct": 0.50, "trigger_every": 0},
 }
 
+COPY_TRADING = {
+    "enabled": False,
+    "auto_enable_equity_threshold": 300,
+    "profit_share_ratio": 0.10,
+    "min_copy_amount": 10.0,
+    "max_copy_amount": 10000.0,
+    "max_daily_trades": 3,
+    "avoid_high_freq": True,
+    "min_interval_seconds": 300,
+}
+
 MODE_RISK_BUDGET = {
     "offensive": 1.2,
     "standard": 1.0,

@@ -15,7 +15,7 @@ from typing import Optional
 from config import STAGES, SIGNAL
 from stage_manager import StageManager
 from lock_manager import LockManager
-from calendar import Calendar, detect_regime
+from _macro_calendar import Calendar, detect_regime
 from strategic_brain import StrategicBrain
 from tactical_brain import TacticalBrain, Signal
 from execution_layer import ExecutionLayer
@@ -86,6 +86,7 @@ class Commander:
 
     def _tick(self):
         now = datetime.now()
+        self.lead_trader.check_and_auto_enable()
 
         # ── 更新净值 ──
         equity = self._fetch_equity()
@@ -339,14 +340,7 @@ class Commander:
 # ═══════════════════════════════════════════
 
 def main():
-    # TODO: 替换为真实 Gate API client 初始化
-    # from gate_api import ApiClient, Configuration, FuturesApi
-    # config = Configuration(host="https://api.gateio.ws/api/v4")
-    # config.key = os.getenv("GATE_API_KEY")
-    # config.secret = os.getenv("GATE_API_SECRET")
-    # client = FuturesApi(ApiClient(config))
-
-    client = None  # 占位
+    client = init_gate_client()
 
     bot = Commander(client)
     bot.run()
