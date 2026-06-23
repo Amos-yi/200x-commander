@@ -5,6 +5,7 @@
 
 import time
 import logging
+from datetime import datetime
 from typing import Optional
 from config import EXIT, SIGNAL
 
@@ -56,7 +57,7 @@ class ExecutionLayer:
             return None
 
         # 周末减半
-        from calendar import Calendar
+        from _macro_calendar import Calendar
         if Calendar.is_weekend():
             contract_size = max(1, int(contract_size * SIGNAL["weekend_margin_mult"]))
 
@@ -277,6 +278,247 @@ class ExecutionLayer:
             return [p for p in positions if float(p.size) != 0]
         except Exception:
             return []
+
+    @staticmethod
+    def _ema_last(values, period):
+        if len(values) < period:
+            return values[-1]
+        k = 2 / (period + 1)
+        ema = sum(values[:period]) / period
+        for v in values[period:]:
+            ema = v * k + ema * (1 - k)
+        return ema
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  纸面执行层 —— 手续费 + 滑点
+# ═══════════════════════════════════════════════════════════════════
+
+class PaperExecutionLayer:
+    """与 ExecutionLayer 同接口，但不调用 Gate API。
+    所有成交在内存模拟，每次开仓/平仓扣除手续费 + 滑点。
+    """
+
+    def __init__(self, stage_params: dict, lock_manager, taker_fee=0.0005, slippage=0.0003):
+        self.params = stage_params
+        self.locks = lock_manager
+        self.taker_fee = taker_fee
+        self.slippage = slippage
+
+        self._position = None       # dict or None
+        self._stops = {}            # { "limit": price, "market": price }
+        self._take_profits = []     # [(tp_price, tp_size), ...]
+        self._equity = 100.0        # 纸面净值
+        self._log = logging.getLogger("commander.paper")
+
+    # ── 开仓 ────────────────────────────────────
+
+    def open_position(self, signal) -> Optional[dict]:
+        symbol = getattr(signal, "symbol", "ETH_USDT")
+        direction = getattr(signal, "direction", "long")
+        entry_price = getattr(signal, "entry_price", 0.0)
+
+        if self._position is not None:
+            self._log.info("已有持仓，不开新仓")
+            return None
+
+        locked, reason = self.locks.is_locked()
+        if locked:
+            self._log.info(f"封锁中，跳过: {reason}")
+            return None
+
+        margin = float(self.params.get("margin", 5.0))
+        leverage = int(self.params.get("leverage", 200))
+        nominal = margin * leverage
+        contract_size = int(nominal / entry_price) if entry_price > 0 else 0
+        if contract_size <= 0:
+            self._log.error(f"合约数量 0")
+            return None
+
+        from _macro_calendar import Calendar
+        if Calendar.is_weekend():
+            from config import SIGNAL
+            contract_size = max(1, int(contract_size * SIGNAL["weekend_margin_mult"]))
+
+        # 模拟成交价：方向不利滑点
+        if direction == "long":
+            fill_price = entry_price * (1 + self.slippage)
+        else:
+            fill_price = entry_price * (1 - self.slippage)
+
+        # 手续费从净值扣除
+        fee = nominal * self.taker_fee
+        self._equity -= fee
+
+        self._position = {
+            "symbol": symbol,
+            "direction": direction,
+            "entry_price": fill_price,
+            "contract_size": contract_size,
+            "margin": margin,
+            "nominal": nominal,
+            "entry_time": datetime.now(),
+        }
+
+        # 止损
+        hard_stop_pct = float(self.params.get("hard_stop_pct", 0.015))
+        buffer_pct = float(self.params.get("liquidation_buffer_pct", 0.01))
+        if direction == "long":
+            self._stops["limit"] = fill_price * (1 - hard_stop_pct)
+            self._stops["market"] = fill_price * (1 - hard_stop_pct - buffer_pct)
+        else:
+            self._stops["limit"] = fill_price * (1 + hard_stop_pct)
+            self._stops["market"] = fill_price * (1 + hard_stop_pct + buffer_pct)
+
+        # 止盈
+        self._take_profits = self._calc_take_profits(direction, fill_price, contract_size)
+
+        self._log.info(
+            f"纸面开仓: {symbol} {direction} x{contract_size} @ {fill_price:.4f} "
+            f"滑点:{self.slippage:.4f} 手续费:{fee:.4f} 净值:{self._equity:.2f}"
+        )
+        return {
+            "order_id": "paper",
+            "entry_price": fill_price,
+            "contract_size": contract_size,
+            "direction": direction,
+            "stop_order_id": "paper_limit_stop",
+            "market_stop_order_id": "paper_market_stop",
+        }
+
+    def _calc_take_profits(self, direction, entry, size):
+        from config import EXIT
+        tp1_pct = EXIT["tp1_pct"]
+        tp2_pct = EXIT["tp2_pct"]
+        tp1_size = -int(size * EXIT["tp1_ratio"])
+        tp2_size = -int(size * EXIT["tp2_ratio"])
+        result = []
+        if direction == "long":
+            if abs(tp1_size) > 0:
+                result.append((entry * (1 + tp1_pct), tp1_size))
+            if abs(tp2_size) > 0:
+                result.append((entry * (1 + tp2_pct), tp2_size))
+        else:
+            if abs(tp1_size) > 0:
+                result.append((entry * (1 - tp1_pct), tp1_size))
+            if abs(tp2_size) > 0:
+                result.append((entry * (1 - tp2_pct), tp2_size))
+        return result
+
+    # ── 持仓管理 ────────────────────────────────
+
+    def manage_positions(self, entry_price, entry_time, direction, klines_5m) -> Optional[str]:
+        if self._position is None:
+            return None
+        if not klines_5m or len(klines_5m) == 0:
+            return None
+
+        current_price = float(klines_5m[-1].get("close", 0))
+        if current_price <= 0:
+            return None
+
+        pos = self._position
+        entry = float(pos["entry_price"])
+        pnl_pct = ((current_price - entry) / entry) if direction == "long" else ((entry - current_price) / entry)
+
+        # 止损触发
+        if direction == "long":
+            if current_price <= self._stops.get("market", -99999):
+                self._close_position(current_price, "硬止损(兜底)")
+                return "stop_loss"
+            if current_price <= self._stops.get("limit", -99999):
+                self._close_position(current_price, "硬止损(限价)")
+                return "stop_loss"
+        else:
+            if current_price >= self._stops.get("market", 99999):
+                self._close_position(current_price, "硬止损(兜底)")
+                return "stop_loss"
+            if current_price >= self._stops.get("limit", 99999):
+                self._close_position(current_price, "硬止损(限价)")
+                return "stop_loss"
+
+        # 止盈触发
+        for tp_price, tp_size in self._take_profits:
+            hit = ((direction == "long" and current_price >= tp_price) or
+                   (direction == "short" and current_price <= tp_price))
+            if hit:
+                self._close_position(current_price, "止盈")
+                return "take_profit"
+
+        # 保本线
+        hard_stop_pct = float(self.params.get("hard_stop_pct", 0.015))
+        from config import EXIT
+        breakeven_threshold = hard_stop_pct * EXIT["breakeven_multiplier"]
+        if pnl_pct >= breakeven_threshold:
+            self._move_stop_to_breakeven(entry, direction)
+            return "breakeven_moved"
+
+        # 时间止损
+        elapsed = datetime.now() - entry_time
+        if elapsed.total_seconds() / 3600 > EXIT["time_stop_hours"]:
+            if pnl_pct < EXIT["time_stop_min_pnl"]:
+                self._close_position(current_price, "时间止损")
+                return "time_exit"
+
+        # 跟踪止损
+        if klines_5m and len(klines_5m) >= 5:
+            closes = [float(k["close"]) for k in klines_5m]
+            ema5 = self._ema_last(closes, EXIT.get("trailing_ema", 5))
+            if (direction == "long" and current_price < ema5) or \
+               (direction == "short" and current_price > ema5):
+                self._close_position(current_price, "跟踪止损")
+                return "trailing_exit"
+
+        return None
+
+    def _move_stop_to_breakeven(self, entry_price, direction):
+        if direction == "long" and self._stops.get("limit", 0) < entry_price:
+            self._stops["limit"] = entry_price
+        elif direction == "short" and self._stops.get("limit", 99999) > entry_price:
+            self._stops["limit"] = entry_price
+
+    def _close_position(self, current_price, reason=""):
+        """平仓：扣除手续费，更新净值"""
+        if self._position is None:
+            return
+        pos = self._position
+        direction = pos["direction"]
+        entry = pos["entry_price"]
+        size = pos["contract_size"]
+        nominal = pos["nominal"]
+
+        # 平仓滑点（不利方向）
+        if direction == "long":
+            exit_price = current_price * (1 - self.slippage)
+            pnl = (exit_price - entry) * size
+        else:
+            exit_price = current_price * (1 + self.slippage)
+            pnl = (entry - exit_price) * size
+
+        # 平仓手续费
+        fee = nominal * self.taker_fee
+        pnl -= fee
+        self._equity += pnl
+
+        self._log.info(
+            f"纸面平仓: {pos['symbol']} {direction} x{size} "
+            f"@{entry:.4f}→{exit_price:.4f} 盈亏:{pnl:+.4f}U "
+            f"手续费:{fee:.4f} 净值:{self._equity:.2f} ({reason})"
+        )
+
+        self._position = None
+        self._stops = {}
+        self._take_profits = []
+
+    def _close_all(self):
+        self._close_position(self._position["entry_price"], "市价全平") if self._position else None
+
+    def check_stop_cancelled(self) -> bool:
+        return False  # 纸面不存在手动撤销
+
+    @property
+    def equity(self) -> float:
+        return round(self._equity, 8)
 
     @staticmethod
     def _ema_last(values, period):

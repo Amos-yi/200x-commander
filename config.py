@@ -118,6 +118,12 @@ COPY_TRADING = {
     "min_interval_seconds": 300,
 }
 
+PAPER_MODE = True
+
+TAKER_FEE = 0.0005   # 0.05% 吃单手续费
+MAKER_FEE = 0.0002   # 0.02% 挂单手续费（暂未使用）
+SLIPPAGE = 0.0003    # 0.03% 滑点
+
 MODE_RISK_BUDGET = {
     "offensive": 1.2,
     "standard": 1.0,

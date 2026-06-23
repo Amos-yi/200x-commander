@@ -12,13 +12,13 @@ import signal as os_signal
 from datetime import datetime, timedelta
 from typing import Optional
 
-from config import STAGES, SIGNAL
+from config import STAGES, SIGNAL, PAPER_MODE, TAKER_FEE, SLIPPAGE
 from stage_manager import StageManager
 from lock_manager import LockManager
 from _macro_calendar import Calendar, detect_regime
 from strategic_brain import StrategicBrain
 from tactical_brain import TacticalBrain, Signal
-from execution_layer import ExecutionLayer
+from execution_layer import ExecutionLayer, PaperExecutionLayer
 from gate_client import init_gate_client
 from lead_trader import LeadTrader, load_copy_trading_config
 from trade_logger import log_trade, recent_stats
@@ -49,13 +49,25 @@ class Commander:
 
     def __init__(self, gate_client):
         self.client = gate_client
+        self.paper = PAPER_MODE
         self.lead_trader = self._init_lead_trader()
         self.state = self._load_or_init()
         self.stage = StageManager(self.state.get("equity", 100.0))
         self.locks = LockManager()
         self.strategic = StrategicBrain()
         self.tactical = TacticalBrain()
-        self.executor = ExecutionLayer(gate_client, self.stage.get_params(), self.locks)
+
+        if self.paper:
+            self.executor = PaperExecutionLayer(
+                self.stage.get_params(), self.locks,
+                taker_fee=TAKER_FEE, slippage=SLIPPAGE,
+            )
+            log.info("纸面模式: 手续费=%.4f 滑点=%.4f", TAKER_FEE, SLIPPAGE)
+        else:
+            self.executor = ExecutionLayer(
+                gate_client, self.stage.get_params(), self.locks
+            )
+            log.info("实盘模式: API 已连接")
 
         self._entry_price = 0.0
         self._entry_time = None
@@ -115,8 +127,8 @@ class Commander:
                 self.client, self.stage.get_params(), self.locks
             )
 
-        # ── 止损撤销检测 ──
-        if self.executor.check_stop_cancelled():
+        # ── 止损撤销检测（纸面跳过）──
+        if not self.paper and self.executor.check_stop_cancelled():
             self.locks.on_stop_cancelled()
             log.critical("!!! 检测到手动撤止损 → 锁定 7 天 !!!")
 
@@ -288,7 +300,9 @@ class Commander:
     # ═══════════════════════════════════════════
 
     def _fetch_equity(self) -> Optional[float]:
-        """优先返回真实 API 净值，失败回退到 state.json"""
+        """优先返回真实 API 净值，纸面模式用 executor 净值，失败回退到 state.json"""
+        if self.paper:
+            return self.executor.equity
         try:
             if self.client is not None:
                 account = self.client.futures_list_accounts(settle="usdt")
@@ -308,6 +322,11 @@ class Commander:
         return 0.0
 
     def _list_positions(self) -> list:
+        if self.paper:
+            pos = self.executor._position
+            if pos is None:
+                return []
+            return [{"contract": pos["symbol"], "size": str(pos["contract_size"]), "mark_price": str(pos["entry_price"])}]
         try:
             if self.client is not None:
                 positions = self.client.futures_list_positions(settle="usdt")
