@@ -24,6 +24,7 @@ from lead_trader import LeadTrader, load_copy_trading_config
 from trade_logger import log_trade, recent_stats
 from _forward_validator import ForwardValidator
 from _macro_filter import MacroFilter
+from pushplus import PushPlus
 
 # ── 日志 ──
 logging.basicConfig(
@@ -61,6 +62,7 @@ class Commander:
         self.fwd = ForwardValidator(bars_to_wait=45)   # 45 ticks ≈ 45 分钟 ≈ 3x15m K线
         self.macro = MacroFilter()
         self._pending_signal = None
+        self.pushplus = PushPlus(os.getenv("PUSHPLUS_TOKEN", ""))
 
         if self.paper:
             self.executor = PaperExecutionLayer(
@@ -86,12 +88,7 @@ class Commander:
         """初始化带单模块，注入 PushPlus 通知。"""
         ct_cfg = load_copy_trading_config()
         lt = LeadTrader(self.client, ct_cfg)
-        # 注入 PushPlus 通知（如果可用）
-        try:
-            from pushplus import pushplus
-            lt.set_notifier(pushplus)
-        except Exception:
-            pass
+        lt.set_notifier(self.pushplus)
         return lt
 
     # ═══════════════════════════════════════════
@@ -104,6 +101,7 @@ class Commander:
         log.info(self.stage.summary())
         log.info(self.fwd.summary())
         log.info(self.macro.summary())
+        log.info(f"PushPlus: {'已启用' if self.pushplus.enabled else '未配置 — 设 PUSHPLUS_TOKEN 后启用'}")
         log.info("=" * 50)
 
         # 输出首次作战指令
@@ -206,6 +204,8 @@ class Commander:
             )
             if result:
                 equity_after = self._fetch_equity()
+                pnl = (equity_after or equity) - equity
+                pnl_pct = pnl / equity if equity > 0 else 0
                 log_trade(
                     symbol=positions[0].get("contract", ""),
                     direction=self._entry_direction,
@@ -215,15 +215,21 @@ class Commander:
                     nominal=self.stage.get_params().get("nominal", 0),
                     equity_before=equity,
                     equity_after=equity_after or equity,
-                    pnl=(equity_after or equity) - equity,
-                    pnl_pct=((equity_after or equity) - equity) / equity if equity > 0 else 0,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
                     exit_reason=result,
                     stage=self.stage.stage,
                     stop_hit=result in ("trailing_exit", "time_exit"),
                     mode=self.strategic.mode(),
                 )
-                self.locks.on_trade_closed(
-                    (equity_after or equity) - equity, equity_after or equity
+                self.locks.on_trade_closed(pnl, equity_after or equity)
+                # PushPlus 平仓通知
+                self.pushplus.notify_close(
+                    symbol=positions[0].get("contract", ""),
+                    direction=self._entry_direction,
+                    pnl=pnl, pnl_pct=pnl_pct,
+                    exit_reason=result,
+                    equity=equity_after or equity,
                 )
                 self._entry_price = 0.0
                 self._entry_direction = ""
@@ -284,6 +290,16 @@ class Commander:
                 f"保证金:{params['margin']:.2f}U 名义:{params['nominal']:.0f}U "
                 f"止损:{params['hard_stop_pct']:.1%} 模式:{self.strategic.mode()}"
             )
+            # PushPlus 开仓通知
+            hard_stop = result["entry_price"] * (1 - params["hard_stop_pct"]) \
+                if signal.direction == "long" else result["entry_price"] * (1 + params["hard_stop_pct"])
+            self.pushplus.notify_open(
+                symbol=signal.symbol, direction=signal.direction,
+                entry_price=result["entry_price"], margin=params["margin"],
+                nominal=params["nominal"], stop=hard_stop,
+                mode=self.strategic.mode(), score=signal.score,
+                stage_name=self.stage.stage_name(),
+            )
 
     # ═══════════════════════════════════════════
     #  信号扫描 → 开仓
@@ -341,6 +357,18 @@ class Commander:
             json.dump(briefing, f, indent=2, ensure_ascii=False)
         log.info(f"每日简报已保存: {path}")
 
+        # PushPlus 日报推送
+        report_lines = [
+            f"# 200x Commander 日报",
+            f"",
+            f"**日期**: {briefing['date']}",
+            f"**模式**: {self.strategic.mode()}",
+            f"**阶段**: {self.stage.summary()}",
+            f"**前瞻**: {self.fwd.summary()}",
+            f"**宏观**: {self.macro.summary()}",
+        ]
+        self.pushplus.daily_report("\n".join(report_lines))
+
     # ═══════════════════════════════════════════
     #  阶段切换
     # ═══════════════════════════════════════════
@@ -348,10 +376,12 @@ class Commander:
     def _on_stage_transition(self, direction: str):
         old_stage = self.stage.stage - 1 if direction == "up" else self.stage.stage + 1
         if direction == "up":
-            log.info(f"🚀 阶段{old_stage} → 阶段{self.stage.stage} ({self.stage.stage_name()})")
+            msg = f"🚀 阶段{old_stage} → 阶段{self.stage.stage} ({self.stage.stage_name()})"
         elif direction == "down":
-            log.info(f"⚠️ 阶段{old_stage} → 阶段{self.stage.stage} ({self.stage.stage_name()})")
+            msg = f"⚠️ 阶段{old_stage} → 阶段{self.stage.stage} ({self.stage.stage_name()})"
+        log.info(msg)
         log.info(f"首日半仓保护已激活")
+        self.pushplus.alert("warn", msg)
 
     # ═══════════════════════════════════════════
     #  API 封装 — 公开数据用 gate_data，账户/下单用 client
