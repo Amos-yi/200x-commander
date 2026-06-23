@@ -22,6 +22,8 @@ from execution_layer import ExecutionLayer, PaperExecutionLayer
 from gate_client import init_gate_client
 from lead_trader import LeadTrader, load_copy_trading_config
 from trade_logger import log_trade, recent_stats
+from _forward_validator import ForwardValidator
+from _macro_filter import MacroFilter
 
 # ── 日志 ──
 logging.basicConfig(
@@ -56,6 +58,9 @@ class Commander:
         self.locks = LockManager()
         self.strategic = StrategicBrain()
         self.tactical = TacticalBrain()
+        self.fwd = ForwardValidator(bars_to_wait=45)   # 45 ticks ≈ 45 分钟 ≈ 3x15m K线
+        self.macro = MacroFilter()
+        self._pending_signal = None
 
         if self.paper:
             self.executor = PaperExecutionLayer(
@@ -97,6 +102,8 @@ class Commander:
         log.info("=" * 50)
         log.info("200x Commander Bot 启动")
         log.info(self.stage.summary())
+        log.info(self.fwd.summary())
+        log.info(self.macro.summary())
         log.info("=" * 50)
 
         # 输出首次作战指令
@@ -123,14 +130,20 @@ class Commander:
         transition = self.stage.update_equity(equity)
         if transition:
             self._on_stage_transition(transition)
-            self.executor = ExecutionLayer(
-                self.client, self.stage.get_params(), self.locks
-            )
+            if not self.paper:
+                self.executor = ExecutionLayer(
+                    self.client, self.stage.get_params(), self.locks
+                )
 
         # ── 止损撤销检测（纸面跳过）──
         if not self.paper and self.executor.check_stop_cancelled():
             self.locks.on_stop_cancelled()
             log.critical("!!! 检测到手动撤止损 → 锁定 7 天 !!!")
+
+        # ── 前瞻验证：信号挂起中？──
+        if self.fwd.is_waiting():
+            self._tick_forward_validate()
+            return
 
         # ── 锁检查 ──
         locked, reason = self.locks.is_locked()
@@ -144,10 +157,8 @@ class Commander:
         regime = detect_regime(self._fetch_klines_1h("BTC_USDT"))
 
         if self.stage.stage == 1:
-            # 阶段 1 用传入参数，阶段 2+ 用 stats
             briefing = self.strategic.decide(
-                equity=equity,
-                stage=self.stage.stage,
+                equity=equity, stage=self.stage.stage,
                 stage_name=self.stage.stage_name(),
                 distance_to_target=self.stage.distance_to_stage_target(),
                 progress_pct=self.stage.progress_in_stage(),
@@ -162,8 +173,7 @@ class Commander:
             avg_l = abs(stats.get("avg_loss", 0))
             pnl_ratio = avg_w / avg_l if avg_l > 0 else None
             briefing = self.strategic.decide(
-                equity=equity,
-                stage=self.stage.stage,
+                equity=equity, stage=self.stage.stage,
                 stage_name=self.stage.stage_name(),
                 distance_to_target=self.stage.distance_to_stage_target(),
                 progress_pct=self.stage.progress_in_stage(),
@@ -185,10 +195,8 @@ class Commander:
         positions = self._list_positions()
 
         if len(positions) == 0:
-            # 无持仓 → 扫描信号
             self._scan_and_open()
         else:
-            # 有持仓 → 管理出场
             klines_5m = self._fetch_klines_5m(positions[0].get("contract", "BTC_USDT"))
             result = self.executor.manage_positions(
                 self._entry_price,
@@ -224,10 +232,65 @@ class Commander:
         self._save_state()
 
     # ═══════════════════════════════════════════
+    #  前瞻验证 —— 信号挂起后的每 tick 检查
+    # ═══════════════════════════════════════════
+
+    def _tick_forward_validate(self):
+        """前瞻验证挂起中：获取当前价 → 检查 → pass/open 或 fail/discard"""
+        symbol = self._pending_signal.symbol if self._pending_signal else "ETH_USDT"
+        klines = self._fetch_klines_15m(symbol)
+        if not klines or len(klines) == 0:
+            return
+        current_price = float(klines[-1].get("close", 0))
+        if current_price <= 0:
+            return
+
+        result = self.fwd.tick(current_price)
+
+        if result == "pass":
+            self._execute_pending_signal()
+        elif result == "fail":
+            log.info(f"信号丢弃: {self.fwd.summary()}")
+            self._pending_signal = None
+        # "waiting" → 继续等，不动作
+
+    def _execute_pending_signal(self):
+        """前瞻验证通过后，宏观过滤 → 开仓"""
+        if self._pending_signal is None:
+            return
+
+        signal = self._pending_signal
+        self._pending_signal = None
+
+        # 宏观过滤器
+        allowed, reason, risk_adj = self.macro.check(signal.direction)
+        if not allowed:
+            log.info(f"宏观过滤拒绝: {reason}")
+            return
+        if risk_adj < 1.0:
+            log.info(f"宏观减仓: {reason} (系数:{risk_adj})")
+            # TODO: apply risk_adj to position size
+
+        # 开仓
+        log.info(f"前瞻验证通过 + 宏观放行 → 开仓: {signal.symbol} {signal.direction} @{signal.entry_price:.2f}")
+        result = self.executor.open_position(signal)
+        if result:
+            self._entry_price = result["entry_price"]
+            self._entry_time = datetime.now()
+            self._entry_direction = signal.direction
+            params = self.stage.get_params()
+            log.info(
+                f"开仓成功 | {signal.symbol} {signal.direction} "
+                f"保证金:{params['margin']:.2f}U 名义:{params['nominal']:.0f}U "
+                f"止损:{params['hard_stop_pct']:.1%} 模式:{self.strategic.mode()}"
+            )
+
+    # ═══════════════════════════════════════════
     #  信号扫描 → 开仓
     # ═══════════════════════════════════════════
 
     def _scan_and_open(self):
+        """扫描信号 → 注册到前瞻验证器，不直接开仓"""
         params = self.stage.get_params()
         briefing = self.strategic.briefing()
 
@@ -242,20 +305,13 @@ class Commander:
 
             log.info(
                 f"信号: {signal.symbol} {signal.direction} "
-                f"@{signal.entry_price:.2f} 质量:{signal.score}/10"
+                f"@{signal.entry_price:.2f} 质量:{signal.score}/10 "
+                f"→ 进入前瞻验证(45分钟)"
             )
 
-            result = self.executor.open_position(signal)
-            if result:
-                self._entry_price = result["entry_price"]
-                self._entry_time = datetime.now()
-                self._entry_direction = signal.direction
-
-                log.info(
-                    f"开仓成功 | {signal.symbol} {signal.direction} "
-                    f"保证金:{params['margin']:.2f}U 名义:{params['nominal']:.0f}U "
-                    f"止损:{params['hard_stop_pct']:.1%} 模式:{self.strategic.mode()}"
-                )
+            # 存信号 + 注册前瞻验证
+            self._pending_signal = signal
+            self.fwd.register(signal.symbol, signal.direction, signal.entry_price, signal.score)
             break  # 单仓位 —— 扫到一个就停
 
     # ═══════════════════════════════════════════
@@ -279,6 +335,8 @@ class Commander:
         )
         briefing["stats"] = recent_stats(10)
         briefing["stage_summary"] = self.stage.summary()
+        briefing["fwd_summary"] = self.fwd.summary()
+        briefing["macro_summary"] = self.macro.summary()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(briefing, f, indent=2, ensure_ascii=False)
         log.info(f"每日简报已保存: {path}")
