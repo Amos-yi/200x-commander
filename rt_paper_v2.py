@@ -43,7 +43,15 @@ if os.path.exists(_deploy_cfg_path):
     try:
         with open(_deploy_cfg_path, "r", encoding="utf-8") as _dcf:
             _DEPLOY_CONFIG = json.load(_dcf)
-        _coin = os.environ.get("RT_SYMBOL", "").split("_")[0]
+        # Parse coin from --symbol CLI arg first; fall back to RT_SYMBOL env
+        _coin = ""
+        import sys as _sys
+        for _i, _a in enumerate(_sys.argv):
+            if _a == "--symbol" and _i + 1 < len(_sys.argv):
+                _coin = _sys.argv[_i + 1].split("_")[0]
+                break
+        if not _coin:
+            _coin = os.environ.get("RT_SYMBOL", "").split("_")[0]
         _whitelist = _DEPLOY_CONFIG.get("strategies", {}).get(_coin, [])
         print(f"[deploy_config] coin={_coin} whitelist={_whitelist}")
         _tiers = _DEPLOY_CONFIG.get("tiers", {})
@@ -78,6 +86,10 @@ if os.path.exists(_deploy_cfg_path):
         print(f"[deploy_config] load failed: {_e}")
         traceback.print_exc()
 
+# Gate.io API credentials (from env vars)
+_GATE_KEY = os.environ.get("GATE_API_KEY", "").strip()
+_GATE_SECRET = os.environ.get("GATE_API_SECRET", "").strip()
+
 # ── 常量 ──
 import os as _os_const
 if '__file__' in dir() and __file__:
@@ -93,7 +105,7 @@ _STATE_DEFAULT = _os_const.path.join(_BASE_DIR, "rt_paper_v2_state.json")
 _STATE = _os_const.environ.get("RT_STATE_FILE", _STATE_DEFAULT)
 WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 SYMBOL = _SYMBOL
-INTERVAL = "5m"
+INTERVAL = "15m"
 STATE_FILE = _STATE
 LEADERBOARD_FILE = _os_const.path.join(_BASE_DIR, "rt_paper_v2_leaderboard.json")
 REPORT_DIR = _os_const.path.join(_BASE_DIR, "reports")
@@ -105,15 +117,182 @@ LEVERAGE = 200
 HARD_STOP_PCT = 0.015
 TP1_PCT = 0.03
 TP2_PCT = 0.05
-TAKER_FEE = 0.0005   # 0.05% 吃单
-MAKER_FEE = 0.0002   # 0.02% 挂单
-SLIPPAGE = 0.0003    # 0.03% 滑点（吃单成交）
+# 费率已更新为Gate.io实际费率 (2026-06-25 实际查询)
+TAKER_FEE = 0.00075  # 0.075% 吃单
+MAKER_FEE = -0.0001  # -0.01% 挂单返佣（负值=返）
+SLIPPAGE = 0.0001    # 0.01% 真实滑点
 MIN_BARS = 50
 LEADERBOARD_INTERVAL = 60
 TIME_STOP_HOURS = 8
 GATE_API = "https://api.gateio.ws/api/v4"
 WEBHOOK_ENV_VAR = "WECHAT_WORK_WEBHOOK_URL"
 WEBHOOK_URL = _os_const.environ.get(WEBHOOK_ENV_VAR, "").strip()
+
+# Live mode flag (set via --live CLI)
+LIVE_MODE = False
+
+
+class GateLiveClient:
+    """Minimal Gate.io USDT Perpetual Futures client for live trading."""
+    def __init__(self, api_key, api_secret):
+        self.key = api_key
+        self.secret = api_secret
+        self.host = "https://api.gateio.ws"
+        self.settle = "usdt"
+        # Precision: decimal places per contract (derived from order_price_round)
+        # Source: GET /api/v4/futures/usdt/contracts/{name}.order_price_round
+        self._price_decimals = {
+            "UNI_USDT": 3, "AVAX_USDT": 3,
+            "SUI_USDT": 4, "FET_USDT": 4,
+            "ARB_USDT": 5,
+        }
+
+    def _format_price(self, symbol, price):
+        """Round price to contract tick and return exact string."""
+        nd = self._price_decimals.get(symbol, 4)
+        # Round to nearest tick multiple
+        tick = 10 ** -nd
+        rounded = round(price / tick) * tick
+        # Format with exact number of decimal places
+        # Use format that strips trailing zeros only for >1 prices
+        if rounded >= 1:
+            return f"{rounded:.{nd}f}".rstrip('0').rstrip('.')
+        else:
+            return f"{rounded:.{nd}f}"
+    
+    def _sign(self, method, path, query="", body=""):
+        import hashlib, hmac
+        t = str(int(time.time()))
+        body_hash = hashlib.sha512(body.encode()).hexdigest()
+        msg = f"{method}\n{path}\n{query}\n{body_hash}\n{t}"
+        sig = hmac.new(self.secret.encode(), msg.encode(), hashlib.sha512).hexdigest()
+        return t, sig
+    
+    def _request(self, method, path, query="", body=None):
+        import requests
+        body_str = json.dumps(body) if body else ""
+        t, sig = self._sign(method, path, query, body_str)
+        url = f"{self.host}{path}" + (f"?{query}" if query else "")
+        headers = {"KEY": self.key, "SIGN": sig, "Timestamp": t, "Content-Type": "application/json"}
+        if method == "GET":
+            return requests.get(url, headers=headers, timeout=10)
+        elif method == "DELETE":
+            return requests.delete(url, headers=headers, timeout=10)
+        else:
+            return requests.post(url, headers=headers, data=body_str, timeout=10)
+    
+    def get_balance(self):
+        r = self._request("GET", f"/api/v4/futures/{self.settle}/accounts")
+        if r.status_code == 200:
+            data = r.json()
+            return float(data.get("total", 0)), float(data.get("available", 0))
+        return 0.0, 0.0
+    
+    def get_positions(self):
+        r = self._request("GET", f"/api/v4/futures/{self.settle}/positions")
+        return r.json() if r.status_code == 200 else []
+    
+    def get_price_orders(self):
+        r = self._request("GET", f"/api/v4/futures/{self.settle}/price_orders", query="status=open")
+        return r.json() if r.status_code == 200 else []
+    
+    def set_leverage(self, symbol, leverage):
+        r = self._request("POST", f"/api/v4/futures/{self.settle}/positions/{symbol}/leverage", 
+                         query=f"leverage={leverage}")
+        return r.status_code == 200
+    
+    def open_position(self, symbol, side, size, price=0):
+        body = {
+            "contract": symbol,
+            "size": size if side == "long" else -size,
+            "price": str(price) if price > 0 else "0",
+            "tif": "ioc" if price <= 0 else "gtc",
+            "text": "t-rtlive"
+        }
+        r = self._request("POST", f"/api/v4/futures/{self.settle}/orders", body=body)
+        return r.json() if r.status_code in (200, 201) else None
+
+    def open_position_maker_first(self, symbol, side, size, signal_price, max_wait=5.0):
+        """Try maker order first (rebate). Fall back to market if unfilled."""
+        if side == "long":
+            limit_price = round(signal_price * 0.9997, 6)
+        else:
+            limit_price = round(signal_price * 1.0003, 6)
+
+        body = {
+            "contract": symbol,
+            "size": size if side == "long" else -size,
+            "price": self._format_price(symbol, limit_price),
+            "tif": "poc",
+            "text": "t-rtlive"
+        }
+        r = self._request("POST", f"/api/v4/futures/{self.settle}/orders", body=body)
+        result = r.json() if r.status_code in (200, 201) else None
+        if not result:
+            return self.open_position(symbol, side, size, price=0)
+
+        oid = result.get("id")
+        status = result.get("status", "")
+        if result.get("status") == "finished":
+            return result  # filled as maker (poc guarantee)
+
+        # Wait for poc fill (up to 3s)
+        for _ in range(3):
+            time.sleep(1)
+            check = self._request("GET", f"/api/v4/futures/{self.settle}/orders/{oid}")
+            if check.status_code == 200 and check.json().get("status") == "finished":
+                return check.json()
+
+        # Cancel unfilled poc, fallback to market
+        self._request("DELETE", f"/api/v4/futures/{self.settle}/orders/{oid}")
+        # Fallback: market order
+        return self.open_position(symbol, side, size, price=0)
+    
+    def close_position(self, symbol, side, size):
+        close_size = -size if side == "long" else size
+        body = {
+            "contract": symbol,
+            "size": close_size,
+            "price": "0",
+            "tif": "ioc",
+            "reduce_only": True,
+            "text": "t-rtlive"
+        }
+        r = self._request("POST", f"/api/v4/futures/{self.settle}/orders", body=body)
+        return r.json() if r.status_code in (200, 201) else None
+    
+    def set_stop_order(self, symbol, side, size, trigger_price):
+        rule = 2 if side == "long" else 1
+        close_size = -size if side == "long" else size
+        price_str = self._format_price(symbol, trigger_price)
+        body = {
+            "initial": {
+                "contract": symbol, "size": close_size, "price": "0",
+                "tif": "ioc", "reduce_only": True, "text": "t-sl"
+            },
+            "trigger": {"price": price_str, "rule": rule, "expiration": 86400 * 7}
+        }
+        r = self._request("POST", f"/api/v4/futures/{self.settle}/price_orders", body=body)
+        return r.json() if r.status_code in (200, 201) else None
+    
+    def set_tp_order(self, symbol, side, size, trigger_price):
+        rule = 1 if side == "long" else 2
+        close_size = -size if side == "long" else size
+        price_str = self._format_price(symbol, trigger_price)
+        body = {
+            "initial": {
+                "contract": symbol, "size": close_size, "price": "0",
+                "tif": "ioc", "reduce_only": True, "text": "t-tp"
+            },
+            "trigger": {"price": price_str, "rule": rule, "expiration": 86400 * 7}
+        }
+        r = self._request("POST", f"/api/v4/futures/{self.settle}/price_orders", body=body)
+        return r.json() if r.status_code in (200, 201) else None
+    
+    def cancel_all_price_orders(self, symbol):
+        r = self._request("DELETE", f"/api/v4/futures/{self.settle}/price_orders", 
+                         query=f"contract={symbol}")
+        return r.status_code == 200
 
 
 class StrategyTrack:
@@ -227,7 +406,7 @@ class StrategyTrack:
 
 class RealTimePaperTraderV2:
 
-    def __init__(self):
+    def __init__(self, live_mode=False):
         print(f"正在加载 {len(STRATEGIES)} 个策略 ...")
         self.tracks: Dict[str, StrategyTrack] = {}
         name_counts: Dict[str, int] = {}
@@ -252,12 +431,30 @@ class RealTimePaperTraderV2:
         self.klines: Dict[int, dict] = {}
         self._last_leaderboard_print = 0.0
         self._last_hourly_report = time.time()
+        self._last_tick_time = 0
         self._last_state_save = time.time()
         self._last_heartbeat = 0.0
         self._ws = None
         self._lock = threading.Lock()
+        self.live_mode = live_mode
+        self.live_client = None
+        if live_mode:
+            self.live_client = GateLiveClient(_GATE_KEY, _GATE_SECRET)
+            print(f"[LIVE MODE] Gate.io client initialized")
+            # Set leverage for this contract (retry up to 3 times)
+            for attempt in range(3):
+                if self.live_client.set_leverage(SYMBOL, LEVERAGE):
+                    print(f"[LIVE MODE] 杠杆已设为 {LEVERAGE}x")
+                    break
+                else:
+                    print(f"[LIVE MODE] 设置杠杆失败 (attempt {attempt+1}/3)")
+                    time.sleep(1)
+            else:
+                print(f"[LIVE MODE] ⚠️ 杠杆设置失败，当前杠杆可能不是 {LEVERAGE}x")
         atexit.register(self._safe_shutdown)
         self._load_state()
+        if live_mode and self.live_client:
+            self._recreate_orders()
 
         # 写 PID 文件，供 STOP 脚本精确关停
         _coin = SYMBOL.split('_')[0].lower()
@@ -367,7 +564,15 @@ class RealTimePaperTraderV2:
         if candle["time"] == 0:
             return
         with self._lock:
+            candle_time = candle["time"]
+            # Always update klines to keep real-time high/low/close accurate
             self.klines[candle["time"]] = candle
+            # ── 核心修复：同一根K线内不再重复触发交易判断 ──
+            # 纸面回测用的是已完成K线，实盘之前每收到一次tick就判断一次，
+            # 导致intra-candle噪音频繁触发"策略反转"出场 → 磨损失血。
+            if candle_time == self._last_tick_time:
+                return  # same candle, skip
+            self._last_tick_time = candle_time
             # 裁剪保留最近 500 根 K 线，防止无限增长
             if len(self.klines) > 500:
                 keys = sorted(self.klines.keys())
@@ -528,15 +733,86 @@ class RealTimePaperTraderV2:
         size = margin * LEVERAGE / entry_price
 
         if direction == "long":
-            stop_price = entry_price * (1 - HARD_STOP_PCT)
-            tp1 = entry_price * (1 + TP1_PCT)
-            tp2 = entry_price * (1 + TP2_PCT)
+            F = TAKER_FEE + SLIPPAGE
+            M = MAKER_FEE
+            # Net loss at stop = exactly 1R after fees+slippage
+            stop_price = entry_price * (1 - HARD_STOP_PCT - F) / (1 + F)
+            # Net profit at TP after entry costs + maker exit fee
+            tp1 = entry_price * (1 + 1 * HARD_STOP_PCT + F) / (1 - M)
+            tp2 = entry_price * (1 + 2 * HARD_STOP_PCT + F) / (1 - M)
         else:
-            stop_price = entry_price * (1 + HARD_STOP_PCT)
-            tp1 = entry_price * (1 - TP1_PCT)
-            tp2 = entry_price * (1 - TP2_PCT)
+            F = TAKER_FEE + SLIPPAGE
+            M = MAKER_FEE
+            stop_price = entry_price * (1 + HARD_STOP_PCT + F) / (1 - F)
+            tp1 = entry_price * (1 - F - 1 * HARD_STOP_PCT) / (1 + M)
+            tp2 = entry_price * (1 - F - 2 * HARD_STOP_PCT) / (1 + M)
 
         entry_notional = size * entry_price
+        dir_cn = "多" if direction == "long" else "空"
+
+        # ── 实盘模式：先 API 成交，再设纸面持仓 ──
+        if self.live_mode and self.live_client:
+            contract = SYMBOL
+            live_size = max(1, int(size))
+            self.live_client.cancel_all_price_orders(contract)
+            result = self.live_client.open_position_maker_first(contract, direction, live_size, entry_price)
+            if result:
+                # Verify the order actually filled
+                status = result.get("status", "")
+                fill_price = float(result.get("fill_price", 0) or 0)
+                if status != "finished" or fill_price <= 0:
+                    print(f"[LIVE] 开仓未成交: status={status} fill={fill_price}")
+                    self._notify_trade(
+                        f"⚠️ {track.name} 开仓未成交",
+                        f"{direction.upper()} {live_size}张 @ ~{entry_price:.2f} | status={status}")
+                    return  # Don't set paper position
+
+                # 开仓成功后确保杠杆正确（新合约首次开仓时可能无持仓）
+                self.live_client.set_leverage(contract, LEVERAGE)
+
+                print(f"[LIVE] 已开仓 {contract} {direction} {live_size}张 @ 实盘{fill_price:.4f} (信号{entry_price:.2f})")
+                # Set SL/TP condition orders
+                sl_result = self.live_client.set_stop_order(contract, direction, live_size, stop_price)
+                if sl_result:
+                    print(f"[LIVE] 止损单已设 @ {stop_price:.4f}")
+                tp_result = self.live_client.set_tp_order(contract, direction, live_size, tp2)
+                if tp_result:
+                    print(f"[LIVE] 止盈单已设 @ {tp2:.4f}")
+                
+                time.sleep(0.3)
+                bal = self.live_client.get_balance()[0]
+                
+                # NOW set paper position (synced with real)
+                track.position = {
+                    "side": direction,
+                    "entry_price": fill_price,  # Use real fill price
+                    "entry_time": now,
+                    "size": live_size,          # Use real contract count
+                    "margin": round(margin, 2),
+                    "stop_price": stop_price,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "breakeven_activated": False,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "entry_notional": live_size * fill_price,
+                }
+                self._sync_orders()  # ensure all positions have SL/TP
+                print(f"[{track.name}] 开仓 {direction.upper()} @ {fill_price:.4f} "
+                      f"止损:{stop_price:.2f} TP1:{tp1:.2f} TP2:{tp2:.2f}")
+                self._notify_trade(
+                    f"⚡ {track.name} 实盘开{dir_cn}",
+                    f"入场: **{fill_price:.4f}** | 止损: {stop_price:.4f} | 止盈: {tp2:.4f}\n"
+                    f"数量: {live_size}张 ({direction.upper()}) | 余额: {bal:.2f}U")
+                return
+            else:
+                print(f"[LIVE] 开仓失败: API returned None")
+                self._notify_trade(
+                    f"❌ {track.name} 开仓失败",
+                    f"{direction.upper()} {live_size}张 @ ~{entry_price:.2f}")
+                return  # Don't set paper position
+
+        # ── 模拟盘模式：直接设纸面持仓 ──
         track.position = {
             "side": direction,
             "entry_price": entry_price,
@@ -551,7 +827,6 @@ class RealTimePaperTraderV2:
             "tp2_hit": False,
             "entry_notional": entry_notional,
         }
-        dir_cn = "多" if direction == "long" else "空"
         print(f"[{track.name}] 开仓 {direction.upper()} @ {entry_price:.2f} "
               f"止损:{stop_price:.2f} TP1:{tp1:.2f} TP2:{tp2:.2f}")
         self._notify_trade(
@@ -629,11 +904,45 @@ class RealTimePaperTraderV2:
         }
         reason_cn = reason_map.get(exit_reason, exit_reason)
 
-        self._notify_trade(
-            f"💰 {track.name} 平{dir_cn}",
-            f"入场: {entry:.4f} → 出场: **{exit_price:.4f}**\n"
-            f"盈亏: {pnl_sign}{pnl:+.4f}U ({r_mult:+.2f}R) | {reason_cn}\n"
-            f"净值: {track.equity:.2f}U")
+        if not self.live_mode:
+            self._notify_trade(
+                f"💰 {track.name} 平{dir_cn}",
+                f"入场: {entry:.4f} → 出场: **{exit_price:.4f}**\n"
+                f"盈亏: {pnl_sign}{pnl:+.4f}U ({r_mult:+.2f}R) | {reason_cn}\n"
+                f"净值: {track.equity:.2f}U")
+
+        if self.live_mode and self.live_client:
+            contract = SYMBOL
+            live_size = max(1, int(pos["size"]))
+            self.live_client.cancel_all_price_orders(contract)
+            
+            # Record balance before close for real PnL tracking
+            bal_before = self.live_client.get_balance()[0]
+            
+            result = self.live_client.close_position(contract, direction, live_size)
+            if result:
+                print(f"[LIVE] 已平仓 {contract} {direction} {live_size}张 @ ~{exit_price:.2f} ({exit_reason})")
+                # Refresh leverage after closing
+                self.live_client.set_leverage(contract, LEVERAGE)
+                
+                # Wait briefly for balance to settle, then calc real PnL
+                time.sleep(0.5)
+                bal_after = self.live_client.get_balance()[0]
+                real_pnl = round(bal_after - bal_before, 4)
+                real_r = real_pnl / (pos["margin"] * HARD_STOP_PCT * LEVERAGE) if pos["margin"] > 0 and HARD_STOP_PCT > 0 else 0
+                
+                pnl_sign = "+" if real_pnl >= 0 else ""
+                self._notify_trade(
+                    f"✅ {track.name} 实盘平仓",
+                    f"入场: {pos['entry_price']:.4f} → 出场: ~{exit_price:.4f}\n"
+                    f"实盘盈亏: {pnl_sign}{real_pnl:.4f}U ({real_r:+.2f}R) | {exit_reason}\n"
+                    f"余额: {bal_after:.2f}U (变动{real_pnl:+.4f})")
+                self._sync_orders()  # rebuild SL/TP for any remaining positions
+            else:
+                print(f"[LIVE] 平仓失败: {result} 原因: {exit_reason}")
+                self._notify_trade(
+                    f"❌ {track.name} 平仓失败",
+                    f"原因: {exit_reason}\nexit_price={exit_price:.4f}")
 
         track.position = None
         track.last_close_time = now
@@ -646,8 +955,9 @@ class RealTimePaperTraderV2:
             print(f"[Webhook] 跳过发送: 未设置环境变量 {WEBHOOK_ENV_VAR}")
             return
 
+        live_tag = "[实盘] " if self.live_mode else ""
         coin = SYMBOL.split("_")[0] if "_" in SYMBOL else SYMBOL
-        content = f"**{coin}** | {title}\n{body}"
+        content = f"**{live_tag}{coin}** | {title}\n{body}"
         payload = _json.dumps({
             "msgtype": "markdown",
             "markdown": {"content": content},
@@ -666,6 +976,55 @@ class RealTimePaperTraderV2:
 
     def _print_leaderboard(self, active_positions: int):
         ranked = sorted(self.tracks.values(), key=lambda t: t.equity, reverse=True)
+        lines = []
+        
+        if self.live_mode and self.live_client:
+            # ── 实盘排行榜：Gate.io 真实持仓 + 余额 ──
+            try:
+                real_total, real_avail = self.live_client.get_balance()
+            except Exception:
+                real_total, real_avail = 0, 0
+            lines.append(f"\n{'='*70}")
+            lines.append(f"[{datetime.now().strftime('%H:%M:%S')}] 实盘排行榜")
+            lines.append(f"  Gate.io 余额: {real_total:.2f}U | 可用: {real_avail:.2f}U | 锁定: {real_total-real_avail:.2f}U")
+            
+            # Fetch real positions
+            positions = self.live_client.get_positions()
+            active = [p for p in positions if int(p.get("size", 0)) != 0]
+            if active:
+                lines.append(f"  {'合约':<12s} {'方向':>5s} {'张数':>6s} {'入场':>10s} {'标记':>10s} {'未实现盈亏':>10s} {'杠杆':>4s}")
+                lines.append("  " + "-" * 62)
+                total_unreal = 0
+                for p in active:
+                    ctr = p.get("contract", "?")
+                    sz = int(p.get("size", 0))
+                    side = "LONG" if sz > 0 else "SHORT"
+                    entry = p.get("entry_price", "?")
+                    mark = p.get("mark_price", "?")
+                    unreal = float(p.get("unrealised_pnl", 0) or 0)
+                    lev = p.get("leverage", "?")
+                    total_unreal += unreal
+                    lines.append(
+                        f"  {ctr:<12s} {side:>5s} {abs(sz):>6d} "
+                        f"{str(entry):>10s} {str(mark):>10s} {unreal:>+10.4f} {str(lev):>4s}"
+                    )
+                lines.append("  " + "-" * 62)
+                lines.append(f"  未实现盈亏合计: {total_unreal:+.4f}U")
+            else:
+                lines.append("  (无持仓)")
+            
+            # SL/TP summary
+            price_orders = self.live_client.get_price_orders()
+            if price_orders:
+                lines.append(f"  条件单 (SL/TP): {len(price_orders)} 个")
+                for po in price_orders[:8]:
+                    trig = po.get("trigger", {})
+                    lines.append(f"    {po.get('contract','?'):12s} 触发@{trig.get('price','?'):>10s} 规则={trig.get('rule','?')}")
+            lines.append("=" * 70)
+            print("\n".join(lines))
+            return
+        
+        # ── 模拟盘排行榜 ──
         lines = ["\n" + "=" * 85]
         lines.append(f"[{datetime.now().strftime('%H:%M:%S')}] 实时排行榜")
         lines.append(f"{'策略名称':<22s} {'净值':>8s} {'盈亏%':>8s} {'交易':>5s} "
@@ -696,8 +1055,9 @@ class RealTimePaperTraderV2:
                     f"{t.profit_factor:>5.2f}  {pos_marker:>6s}"
                 )
         lines.append("=" * 85)
+        total_equity = sum(t.equity for t in self.tracks.values())
         lines.append(f"共 {len(self.tracks)} 策略 | {active_positions} 持仓 "
-                     f"| 总净值: {sum(t.equity for t in self.tracks.values()):.0f}U")
+                     f"| 总净值: {total_equity:.0f}U")
         print("\n".join(lines))
 
     def _save_leaderboard(self):
@@ -865,6 +1225,48 @@ class RealTimePaperTraderV2:
         except Exception as e:
             print(f"状态恢复失败: {e}")
 
+    def _recreate_orders(self):
+        """重启后恢复 SL/TP — 先清空旧单，再为所有持仓重建"""
+        if not self.live_mode or not self.live_client:
+            return
+        contract = SYMBOL
+        recreated = 0
+        self.live_client.cancel_all_price_orders(contract)
+        for track in self.tracks.values():
+            pos = track.position
+            if not pos:
+                continue
+            direction = pos.get("side", "long")
+            live_size = pos.get("size", 0)
+            stop_price = pos.get("stop_price", 0)
+            tp_price = pos.get("tp2", 0)
+            if live_size <= 0 or stop_price <= 0:
+                continue
+            print(f"[LIVE] 重建 {track.name} SL/TP: {direction.upper()} {live_size}张 SL@{stop_price:.4f} TP@{tp_price:.4f}")
+            self.live_client.set_stop_order(contract, direction, live_size, stop_price)
+            self.live_client.set_tp_order(contract, direction, live_size, tp_price)
+            recreated += 1
+        if recreated:
+            print(f"[LIVE] 已为 {recreated} 个持仓重建 SL/TP")
+
+    def _sync_orders(self):
+        """开/平仓后同步 SL/TP — 不取消旧单，补建缺失"""
+        if not self.live_mode or not self.live_client:
+            return
+        contract = SYMBOL
+        for track in self.tracks.values():
+            pos = track.position
+            if not pos:
+                continue
+            direction = pos.get("side", "long")
+            live_size = pos.get("size", 0)
+            stop_price = pos.get("stop_price", 0)
+            tp_price = pos.get("tp2", 0)
+            if live_size <= 0 or stop_price <= 0:
+                continue
+            self.live_client.set_stop_order(contract, direction, live_size, stop_price)
+            self.live_client.set_tp_order(contract, direction, live_size, tp_price)
+
 
 def rotate_log(log_path, max_size_mb=5, keep=3):
     """Rotate log file if it exceeds max_size_mb."""
@@ -885,19 +1287,41 @@ def rotate_log(log_path, max_size_mb=5, keep=3):
 
 
 def main():
+    global SYMBOL, STATE_FILE, LIVE_MODE
+    import argparse
+    parser = argparse.ArgumentParser()
+    _default_symbol = SYMBOL
+    parser.add_argument("--symbol", type=str, default=_default_symbol)
+    parser.add_argument("--live", action="store_true", default=False)
+    args = parser.parse_args()
+    SYMBOL = args.symbol
+    LIVE_MODE = args.live
+    _coin = SYMBOL.split('_')[0].lower()
+    STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() and __file__ else os.getcwd(), f"rt_paper_v2_state_{_coin}.json")
+
+    # Live mode risk override: lower leverage for real money
+    global LEVERAGE, MARGIN_PCT, HARD_STOP_PCT
+    if args.live:
+        LEVERAGE = 30          # 30x leverage
+        MARGIN_PCT = 0.10      # 10% margin per trade
+        HARD_STOP_PCT = 0.03   # 3% stop (wider to cover fees at 30x)
+
     # 启动时轮转日志
-    _log_name = f"rt_{SYMBOL.split('_')[0].lower()}.log"
+    _log_name = f"rt_{_coin}.log"
     _log_path = os.path.join(LOG_DIR, _log_name)
     rotate_log(_log_path)
 
+    mode_str = "LIVE" if args.live else "PAPER"
     print("=" * 60)
-    print("  Real-Time Paper Trading v2")
+    print(f"  Real-Time Trading v2 [{mode_str}]")
     print(f"  {len(STRATEGIES)} 策略并联 | {SYMBOL} {INTERVAL}")
     print(f"  初始: {INITIAL_EQUITY}U/策略 | {LEVERAGE}x | 保证金{MARGIN_PCT*100}%")
     print(f"  止损{HARD_STOP_PCT*100}% | TP1:{TP1_PCT*100}% | TP2:{TP2_PCT*100}%")
+    if args.live:
+        print(f"  ⚡ 实盘模式 - Gate.io {SYMBOL}")
     print("=" * 60)
 
-    trader = RealTimePaperTraderV2()
+    trader = RealTimePaperTraderV2(live_mode=args.live)
     try:
         trader.connect_ws()
     except KeyboardInterrupt:
