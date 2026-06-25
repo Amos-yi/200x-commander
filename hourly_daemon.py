@@ -4,9 +4,19 @@ Run this once and it reports every hour forever.
 """
 import subprocess, sys, time, os
 
+# 加载 .env 获取 webhook URL（python-dotenv 在内置 Python 下可用）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hourly_report.py")
 PYTHON = r"C:\Users\Administrator\gate_bot\.venv\Scripts\python.exe"
 LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "hourly_daemon.log")
+
+# 预备 webhook URL（.env 或系统环境变量）
+WEBHOOK_URL = os.environ.get("WECHAT_WORK_WEBHOOK_URL", "").strip()
 
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -33,7 +43,10 @@ while True:
 
         # Run report
         log("Generating hourly report...")
-        r = subprocess.run([PYTHON, SCRIPT], capture_output=True, text=True, timeout=120)
+        env = os.environ.copy()
+        if WEBHOOK_URL:
+            env["WECHAT_WORK_WEBHOOK_URL"] = WEBHOOK_URL
+        r = subprocess.run([PYTHON, SCRIPT], capture_output=True, text=True, timeout=120, env=env)
         if r.returncode == 0:
             log(f"OK: {r.stdout.strip()}")
         else:

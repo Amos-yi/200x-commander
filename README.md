@@ -10,6 +10,16 @@ pip install -r requirements.txt
 
 依赖：`pandas`、`websocket-client`、`gate-api`。
 
+## Webhook 配置
+
+企业微信 webhook 不再写在代码里。需要推送时，在启动进程前设置环境变量：
+
+```powershell
+$env:WECHAT_WORK_WEBHOOK_URL="<your WeChat Work bot webhook URL>"
+```
+
+未设置 `WECHAT_WORK_WEBHOOK_URL` 时，`rt_paper_v2.py` 的交易通知和 `hourly_report.py` 的小时推送会安全跳过并打印原因；`hourly_report.py` 仍会生成本地 `reports/latest_hourly.md`。
+
 ## 快速启动
 
 ```bash

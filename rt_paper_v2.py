@@ -112,7 +112,8 @@ MIN_BARS = 50
 LEADERBOARD_INTERVAL = 60
 TIME_STOP_HOURS = 8
 GATE_API = "https://api.gateio.ws/api/v4"
-WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=492a138a-c3df-4e7c-9a87-ad8fa1bbfdfa"
+WEBHOOK_ENV_VAR = "WECHAT_WORK_WEBHOOK_URL"
+WEBHOOK_URL = _os_const.environ.get(WEBHOOK_ENV_VAR, "").strip()
 
 
 class StrategyTrack:
@@ -641,6 +642,10 @@ class RealTimePaperTraderV2:
     def _notify_trade(self, title: str, body: str):
         """Send trade notification to WeChat webhook (fire-and-forget)."""
         import json as _json, urllib.request as _ur
+        if not WEBHOOK_URL:
+            print(f"[Webhook] 跳过发送: 未设置环境变量 {WEBHOOK_ENV_VAR}")
+            return
+
         coin = SYMBOL.split("_")[0] if "_" in SYMBOL else SYMBOL
         content = f"**{coin}** | {title}\n{body}"
         payload = _json.dumps({

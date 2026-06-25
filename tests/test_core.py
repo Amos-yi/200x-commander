@@ -14,7 +14,7 @@ sys.path.insert(0, _sys_root)
 import config
 from stage_manager import StageManager
 from lock_manager import LockManager
-from calendar import Calendar, detect_regime
+from _macro_calendar import Calendar, detect_regime
 from strategic_brain import StrategicBrain
 from tactical_brain import TacticalBrain
 from trade_logger import log_trade, recent_stats, LOG_PATH as TRADE_LOG

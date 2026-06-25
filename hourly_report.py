@@ -1,13 +1,15 @@
 """
 Hourly P&L Leaderboard → WeChat Work Webhook
-Reads all rt_paper_v2_state*.json, aggregates by coin, sends markdown report.
+Reads all rt_paper_v2_state*.json, aggregates by coin, saves markdown report,
+and sends it only when a webhook is configured.
 """
 import json, os, glob, urllib.request
 from datetime import datetime, timezone, timedelta
 
 # --- config ---
 BASE = os.path.dirname(os.path.abspath(__file__))
-WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=492a138a-c3df-4e7c-9a87-ad8fa1bbfdfa"
+WEBHOOK_ENV_VAR = "WECHAT_WORK_WEBHOOK_URL"
+WEBHOOK_URL = os.environ.get(WEBHOOK_ENV_VAR, "").strip()
 BEIJING = timezone(timedelta(hours=8))
 
 # Expected initial equity per coin (from deploy_config)
@@ -152,6 +154,10 @@ def format_leaderboard(coins: dict) -> str:
 
 
 def send_webhook(content: str):
+    if not WEBHOOK_URL:
+        print(f"  跳过推送: 未设置环境变量 {WEBHOOK_ENV_VAR}")
+        return None
+
     payload = json.dumps({
         "msgtype": "markdown",
         "markdown": {
@@ -187,7 +193,8 @@ if __name__ == "__main__":
 
     try:
         r = send_webhook(md)
-        print(f"  推送成功: {r}")
+        if r is not None:
+            print(f"  推送成功: {r}")
     except Exception as e:
         print(f"  推送失败: {e}")
         # Also save to log for diagnosis

@@ -8,7 +8,11 @@ import sys
 import json
 import time
 import logging
+import urllib.request
 import signal as os_signal
+
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -223,9 +227,22 @@ class Commander:
                     mode=self.strategic.mode(),
                 )
                 self.locks.on_trade_closed(pnl, equity_after or equity)
+                # 企微 Webhook 平仓通知
+                symbol = positions[0].get("contract", "")
+                emoji = "✅" if pnl > 0 else "❌"
+                dir_cn = "做多" if self._entry_direction == "long" else "做空"
+                self._send_webhook(
+                    f"## {emoji} 平仓\n\n"
+                    f"| 项目 | 值 |\n|------|----|\n"
+                    f"| 币种 | **{symbol}** |\n"
+                    f"| 方向 | {dir_cn} |\n"
+                    f"| 盈亏 | **{pnl:+.2f} U** ({pnl_pct:+.1%}) |\n"
+                    f"| 出场原因 | {result} |\n"
+                    f"| 当前净值 | {(equity_after or equity):.2f} U |\n"
+                )
                 # PushPlus 平仓通知
                 self.pushplus.notify_close(
-                    symbol=positions[0].get("contract", ""),
+                    symbol=symbol,
                     direction=self._entry_direction,
                     pnl=pnl, pnl_pct=pnl_pct,
                     exit_reason=result,
@@ -254,9 +271,12 @@ class Commander:
         result = self.fwd.tick(current_price)
 
         if result == "pass":
+            log.info(f"前瞻验证通过: {self.fwd.summary()}")
+            self._send_webhook(f"## ✅ 前瞻验证通过\n\n**{self.fwd.summary()}**\n> 进入宏观过滤...")
             self._execute_pending_signal()
         elif result == "fail":
             log.info(f"信号丢弃: {self.fwd.summary()}")
+            self._send_webhook(f"## 前瞻验证失败 ❌\n\n**{self.fwd.summary()}\n> 下一信号等待中")
             self._pending_signal = None
         # "waiting" → 继续等，不动作
 
@@ -272,6 +292,7 @@ class Commander:
         allowed, reason, risk_adj = self.macro.check(signal.direction)
         if not allowed:
             log.info(f"宏观过滤拒绝: {reason}")
+            self._send_webhook(f"## 🛑 宏观过滤拒绝\n\n**{reason}**\n> 信号已丢弃")
             return
         if risk_adj < 1.0:
             log.info(f"宏观减仓: {reason} (系数:{risk_adj})")
@@ -293,6 +314,21 @@ class Commander:
             # PushPlus 开仓通知
             hard_stop = result["entry_price"] * (1 - params["hard_stop_pct"]) \
                 if signal.direction == "long" else result["entry_price"] * (1 + params["hard_stop_pct"])
+            dir_cn = "做多" if signal.direction == "long" else "做空"
+            self._send_webhook(
+                f"## ✅ 开仓\n\n"
+                f"> 前瞻验证 **{self.fwd.summary()}**\n\n"
+                f"| 项目 | 值 |\n|------|----|\n"
+                f"| 币种 | **{signal.symbol}** |\n"
+                f"| 方向 | {dir_cn} |\n"
+                f"| 入场价 | {result['entry_price']:.2f} |\n"
+                f"| 保证金 | {params['margin']:.2f} U |\n"
+                f"| 名义仓位 | {params['nominal']:.0f} U |\n"
+                f"| 止损 | {hard_stop:.2f} |\n"
+                f"| 信号质量 | {signal.score}/10 |\n"
+                f"| 模式 | {self.strategic.mode()} |\n"
+                f"| 阶段 | {self.stage.stage_name()} |\n"
+            )
             self.pushplus.notify_open(
                 symbol=signal.symbol, direction=signal.direction,
                 entry_price=result["entry_price"], margin=params["margin"],
@@ -323,6 +359,17 @@ class Commander:
                 f"信号: {signal.symbol} {signal.direction} "
                 f"@{signal.entry_price:.2f} 质量:{signal.score}/10 "
                 f"→ 进入前瞻验证(45分钟)"
+            )
+            dir_cn = "做多" if signal.direction == "long" else "做空"
+            self._send_webhook(
+                f"## 🔔 信号\n\n"
+                f"| 项目 | 值 |\n|------|----|\n"
+                f"| 币种 | **{signal.symbol}** |\n"
+                f"| 方向 | {dir_cn} |\n"
+                f"| 信号价 | {signal.entry_price:.2f} |\n"
+                f"| 质量 | {signal.score}/10 |\n"
+                f"| 模式 | {self.strategic.mode()} |\n\n"
+                f"> ⏳ 前瞻验证中 (45分钟)..."
             )
 
             # 存信号 + 注册前瞻验证
@@ -368,6 +415,28 @@ class Commander:
             f"**宏观**: {self.macro.summary()}",
         ]
         self.pushplus.daily_report("\n".join(report_lines))
+        self._send_webhook("\n".join(report_lines))
+
+    # ═══════════════════════════════════════════
+    #  企微 Webhook（与 PLAN C 共用 WECHAT_WORK_WEBHOOK_URL）
+    # ═══════════════════════════════════════════
+
+    WEBHOOK_URL = os.environ.get("WECHAT_WORK_WEBHOOK_URL", "").strip()
+
+    @staticmethod
+    def _send_webhook(content: str):
+        if not Commander.WEBHOOK_URL:
+            return
+        payload = json.dumps({"msgtype": "markdown", "markdown": {"content": content}}, ensure_ascii=False).encode("utf-8")
+        try:
+            req = urllib.request.Request(Commander.WEBHOOK_URL, data=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode())
+                if body.get("errcode") != 0:
+                    log.warning(f"Webhook 发送失败: {body}")
+        except Exception as e:
+            log.warning(f"Webhook 异常: {e}")
 
     # ═══════════════════════════════════════════
     #  阶段切换
@@ -381,6 +450,7 @@ class Commander:
             msg = f"⚠️ 阶段{old_stage} → 阶段{self.stage.stage} ({self.stage.stage_name()})"
         log.info(msg)
         log.info(f"首日半仓保护已激活")
+        self._send_webhook(f"## {msg}\n\n首日半仓保护已激活")
         self.pushplus.alert("warn", msg)
 
     # ═══════════════════════════════════════════

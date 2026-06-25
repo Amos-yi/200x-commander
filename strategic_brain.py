@@ -9,7 +9,7 @@ from config import (
     STAGES, MODE_RISK_BUDGET, MODE_MAX_TRADES, MODE_QUALITY_THRESHOLD,
     SIGNAL,
 )
-from calendar import Calendar, detect_regime
+from _macro_calendar import Calendar, detect_regime
 
 
 class StrategicBrain:

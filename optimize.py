@@ -9,7 +9,7 @@ from gate_data import fetch_klines
 from backtest import _ht_phase
 from config import STAGES, SIGNAL, SCORE_WEIGHTS, MODE_RISK_BUDGET
 from strategic_brain import StrategicBrain
-from calendar import detect_regime
+from _macro_calendar import detect_regime
 
 
 def run_optimized_backtest(klines, stop_pct, rr_ratio, min_score):

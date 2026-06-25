@@ -1,56 +1,16 @@
-# State files (live trading data, never commit)
-*.json
-*.jsonl
-*.bak
-*.tmp
-.auto_deploy.lock
-
-# Logs
-logs/
-
-# Reports
-reports/
-
-# Python cache
 __pycache__/
-.pytest_cache/
 *.pyc
 *.pyo
-
-# Virtual environment
-.venv/
-venv/
-env/
-
-# IDE / editor
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temp scripts (one-off debug)
-_tmp*.py
-_check_*.py
-_count_*.py
-_env_test.py
-_pd_test.py
-_read_*.py
-_test_*.py
-_top20.py
-_verify_*.py
-_ws_test.py
-_fix_bats.py
-_full_report_*.py
-_run_test.bat
-
-# Bots / historical
+.env
+*.log
+logs/
+*.json
+!deploy_config.json
+!.gitignore
+*.bak
+reports/
+*.state
+*.lock
 briefing_history/
+.pytest_cache/
 backtest_results/
-reviews/
-
-# Keep only the final deliverable
-CLAUDE.md

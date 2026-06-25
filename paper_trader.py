@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import STAGES, SIGNAL, EXIT, LOCKS, MODE_RISK_BUDGET, MODE_QUALITY_THRESHOLD
 from strategic_brain import StrategicBrain
 from tactical_brain import TacticalBrain
-from calendar import detect_regime
+from _macro_calendar import detect_regime
 from gate_data import fetch_klines
 from pushplus import PushPlus
 

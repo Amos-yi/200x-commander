@@ -10,7 +10,7 @@ from typing import Optional, List, Dict
 from config import STAGES, SIGNAL, EXIT, MODE_RISK_BUDGET
 from strategic_brain import StrategicBrain
 from tactical_brain import TacticalBrain
-from calendar import detect_regime
+from _macro_calendar import detect_regime
 
 
 # ── HT_DCPHASE ──

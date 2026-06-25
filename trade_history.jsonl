@@ -1,0 +1,1 @@
+{"time": "2026-06-24T01:35:49.238798", "symbol": "BTC_USDT", "direction": "long", "entry": 50000, "exit": 51000, "margin": 5, "nominal": 1000, "equity_before": 100, "equity_after": 120, "pnl": 20, "pnl_pct": 0.2, "exit_reason": "tp1", "stage": 1, "stop_hit": false, "score": 7, "mode": "standard"}

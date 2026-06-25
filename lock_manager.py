@@ -33,7 +33,7 @@ class LockManager:
             return True, f"非交易时段 ({SIGNAL['active_hour_start']:02d}:00-{SIGNAL['active_hour_end']:02d}:00)"
 
         # [2] 事件锁
-        from calendar import Calendar
+        from _macro_calendar import Calendar
         if Calendar.is_event_window(now):
             return True, f"宏观事件窗口: {Calendar.event_name(now)}"
 
